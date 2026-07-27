@@ -6,9 +6,20 @@ from kb.db import (
     update_entity, merge_entities, upsert_entity, index_entry,
     get_entries_for_entity,
 )
+from seed_entities import seed
 
 page_setup("admin", title="Admin — SN1 Knowledge Base")
 section_title("Entity management")
+
+with st.expander("Bootstrap canonical entities", expanded=False):
+    st.caption(
+        "Run this once on a new database to load the canonical entity list. "
+        "It is safe to re-run because inserts are idempotent."
+    )
+    if st.button("Seed canonical entities", type="primary"):
+        n = seed(verbose=False)
+        st.success(f"Seeded {n} canonical entities.")
+        st.rerun()
 
 tab_active, tab_proposed, tab_cleanup, tab_create = st.tabs([
     "Active Entities", "Proposed (Pending Review)", "Cleanup — No Entries", "Create New"
