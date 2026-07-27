@@ -28,6 +28,7 @@ Render is the simplest option here because it supports a mounted disk, which the
 
 1. Create a new Render Web Service from this repo.
 1. Use the blueprint in [render.yaml](render.yaml) or set the start command to `streamlit run app.py --server.port $PORT --server.address 0.0.0.0`.
+1. If you created a plain Python service, Render should also pick up the [Procfile](Procfile) and start Streamlit from there.
 1. Set `ANTHROPIC_API_KEY` as a secret environment variable.
 1. Add `SN1_SHARE_PASSWORD` if you want the built-in password gate.
 1. Keep the disk mounted at `/var/data`; the app writes the DB to `/var/data/knowledge_base.db` and uploaded docs to `/var/data/sample_docs`.
