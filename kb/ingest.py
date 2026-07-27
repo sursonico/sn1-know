@@ -1,0 +1,614 @@
+"""
+kb/ingest.py — Ingestion pipeline for the SN1 Knowledge Base.
+
+Usage:
+    python -m kb.ingest                    # ingest all new files in DOCS_DIR
+    python -m kb.ingest path/to/file.pdf   # ingest a single file
+"""
+
+import asyncio
+import hashlib
+import io
+import logging
+import re
+import shutil
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import pdfplumber
+from pptx import Presentation
+
+from config import (
+    DOCS_DIR, DB_PATH, INGEST_BATCH_SIZE,
+    MAX_CHARS_PER_DOC, MAX_CHARS_PER_CHUNK, OCR_CHAR_THRESHOLD,
+    VISION_CHAR_THRESHOLD, VISION_IMAGE_COUNT_THRESHOLD, VISION_HYBRID_MAX_CHARS,
+)
+from kb import db
+from kb.llm import (
+    classify_document_async, resolve_entities_async, extract_deals_async,
+    vision_sdk_available, describe_page_images_async,
+)
+
+log = logging.getLogger("sn1.ingest")
+
+
+# ── Dataclass for a single page/slide/sheet chunk ────────────────────────────
+
+@dataclass
+class Chunk:
+    chunk_num: int
+    chunk_type: str   # 'page' | 'slide' | 'sheet' | 'body'
+    text: str
+    image_count: int = 0  # embedded images/pictures on this page or slide
+
+
+@dataclass
+class ExtractionResult:
+    file_type: str
+    chunks: list[Chunk] = field(default_factory=list)
+    ocr_used: bool = False
+    error: str = ""
+
+
+# ── Text extraction ───────────────────────────────────────────────────────────
+
+def _extract_pdf(path: Path) -> ExtractionResult:
+    chunks: list[Chunk] = []
+    scanned_pages: list[int] = []
+    try:
+        with pdfplumber.open(path) as pdf:
+            for i, page in enumerate(pdf.pages, start=1):
+                text = (page.extract_text() or "").strip()
+                n_images = len(page.images)
+                if len(text) < OCR_CHAR_THRESHOLD:
+                    scanned_pages.append(i)
+                    text = text or f"[page {i} — no extractable text]"
+                chunks.append(Chunk(i, "page", text[:MAX_CHARS_PER_CHUNK], image_count=n_images))
+    except Exception as e:
+        return ExtractionResult("PDF", error=str(e))
+
+    ocr_used = False
+    if len(scanned_pages) > len(chunks) // 2 + 1:
+        ocr_used = _try_ocr_fallback(path, chunks, scanned_pages)
+
+    return ExtractionResult("PDF", chunks=chunks, ocr_used=ocr_used)
+
+
+def _try_ocr_fallback(path: Path, chunks: list[Chunk], scanned_pages: list[int]) -> bool:
+    """Replace sparse-text chunks with OCR text. Returns True if OCR was applied."""
+    try:
+        import pytesseract
+        from pdf2image import convert_from_path
+        images = convert_from_path(str(path), dpi=200)
+        for i in scanned_pages:
+            if i - 1 < len(images):
+                ocr_text = pytesseract.image_to_string(images[i - 1]).strip()
+                if ocr_text and i - 1 < len(chunks):
+                    chunks[i - 1] = Chunk(i, "page", ocr_text[:MAX_CHARS_PER_CHUNK])
+        return True
+    except ImportError:
+        return False
+    except Exception as e:
+        log.warning("OCR failed for %s: %s", path.name, e)
+        return False
+
+
+# ── Vision enrichment for image-heavy pages ───────────────────────────────────
+
+def _render_pdf_page_image(path: Path, page_idx: int) -> Optional[bytes]:
+    """
+    Render a PDF page as PNG bytes.
+    Uses pymupdf (fitz) if installed — full rendering including embedded images.
+    Falls back to pdfplumber.to_image() — renders text/vector only; warns if
+    the page appears image-only (embedded images but nearly blank render).
+    Returns None if rendering is not possible.
+    """
+    try:
+        import fitz  # pymupdf
+        doc = fitz.open(str(path))
+        if page_idx >= len(doc):
+            return None
+        page = doc[page_idx]
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+        return pix.tobytes("png")
+    except ImportError:
+        pass  # fall through to pdfplumber
+    except Exception as e:
+        log.debug("pymupdf render failed for %s page %d: %s", path.name, page_idx, e)
+
+    # Fallback: pdfplumber.to_image() — renders vector/text layer only
+    try:
+        buf = io.BytesIO()
+        with pdfplumber.open(path) as pdf:
+            if page_idx >= len(pdf.pages):
+                return None
+            page = pdf.pages[page_idx]
+            n_embedded = len(page.images)
+            img = page.to_image(resolution=120)
+            img.original.save(buf, format="PNG")
+            png = buf.getvalue()
+            if n_embedded > 0 and len(png) < 15_000:
+                log.warning(
+                    "%s page %d: %d embedded images but pdfplumber rendered only %d bytes "
+                    "(likely image-only page). Install pymupdf for full vision: pip install pymupdf",
+                    path.name, page_idx + 1, n_embedded, len(png),
+                )
+            return png
+    except Exception as e:
+        log.debug("pdfplumber.to_image failed for %s page %d: %s", path.name, page_idx, e)
+
+    return None
+
+
+def _extract_pptx_slide_images(path: Path, slide_idx: int) -> tuple:
+    """
+    Extract embedded image blobs from a PPTX slide (PNG and JPEG/WEBP only; skips WMF/EMF).
+    Also captures text from the slide for context.
+    Returns (image_blobs, context_text).
+    """
+    try:
+        from pptx import Presentation
+
+        prs = Presentation(path)
+        if slide_idx >= len(prs.slides):
+            return [], ""
+
+        slide = prs.slides[slide_idx]
+        images: list = []
+        texts: list = []
+
+        def _collect(shapes):
+            sorted_shapes = sorted(
+                shapes,
+                key=lambda s: (getattr(s, "top", 0), getattr(s, "left", 0)),
+            )
+            for shape in sorted_shapes:
+                if shape.shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
+                    try:
+                        blob = shape.image.blob
+                        if (
+                            blob[:4] == b'\x89PNG'
+                            or blob[:2] == b'\xff\xd8'
+                            or (blob[:4] == b'RIFF' and len(blob) > 12 and blob[8:12] == b'WEBP')
+                        ):
+                            images.append(blob)
+                    except Exception:
+                        pass
+                elif shape.shape_type == 6:  # MSO_SHAPE_TYPE.GROUP
+                    try:
+                        _collect(shape.shapes)
+                    except Exception:
+                        pass
+                elif shape.has_text_frame:
+                    try:
+                        lines = [
+                            " ".join(r.text for r in p.runs).strip()
+                            for p in shape.text_frame.paragraphs
+                        ]
+                        text = " ".join(l for l in lines if l)
+                        if text:
+                            texts.append(text)
+                    except Exception:
+                        pass
+
+        _collect(slide.shapes)
+        return images, "\n".join(texts)
+
+    except Exception as e:
+        log.debug("PPTX image extraction failed for %s slide %d: %s", path.name, slide_idx, e)
+        return [], ""
+
+
+def _should_vision_chunk(chunk: Chunk) -> bool:
+    """
+    Returns True if a chunk should be sent to Claude vision.
+    Two triggers:
+      1. Sparse text: very little text extracted (likely image-only page).
+      2. Hybrid: enough embedded images alongside modest text (e.g. broadcaster
+         logo tables where country names extract as text but logos do not).
+    """
+    text_len = len(chunk.text.strip())
+    if text_len < VISION_CHAR_THRESHOLD:
+        return True
+    if (chunk.image_count >= VISION_IMAGE_COUNT_THRESHOLD
+            and text_len < VISION_HYBRID_MAX_CHARS):
+        return True
+    return False
+
+
+async def _vision_enrich_async(path: Path, result: ExtractionResult) -> ExtractionResult:
+    """
+    For chunks with sparse text OR significant embedded images alongside modest text,
+    attempt Claude vision analysis. Augments chunk text with the vision output
+    (marked with [Vision-extracted]).
+
+    Requires ANTHROPIC_API_KEY — logs a warning and returns unchanged result if absent.
+    Only runs on PDF and PPTX files.
+    """
+    if path.suffix.lower() not in (".pdf", ".pptx"):
+        return result
+
+    targets = [
+        i for i, c in enumerate(result.chunks)
+        if _should_vision_chunk(c)
+    ]
+    if not targets:
+        return result
+
+    if not vision_sdk_available():
+        log.warning(
+            "%s has %d image-heavy page(s) but ANTHROPIC_API_KEY is not set — "
+            "vision analysis requires the SDK. Set ANTHROPIC_API_KEY to enable.",
+            path.name, len(targets),
+        )
+        return result
+
+    n_sparse   = sum(1 for i in targets if len(result.chunks[i].text.strip()) < VISION_CHAR_THRESHOLD)
+    n_hybrid   = len(targets) - n_sparse
+    log.info(
+        "%s: vision analysis on %d page(s) (%d sparse, %d hybrid logo/image)",
+        path.name, len(targets), n_sparse, n_hybrid,
+    )
+    new_chunks = list(result.chunks)
+    ext = path.suffix.lower()
+
+    for chunk_idx in targets:
+        chunk = result.chunks[chunk_idx]
+        page_num = chunk.chunk_num   # 1-based
+        page_idx = page_num - 1     # 0-based
+
+        if ext == ".pdf":
+            img_bytes = _render_pdf_page_image(path, page_idx)
+            if not img_bytes:
+                continue
+            image_blobs = [img_bytes]
+            context = chunk.text.strip() or f"PDF page {page_num}"
+        else:  # .pptx
+            image_blobs, slide_text = _extract_pptx_slide_images(path, page_idx)
+            if not image_blobs:
+                continue
+            context = slide_text or chunk.text.strip() or f"Slide {page_num}"
+
+        try:
+            description = await describe_page_images_async(image_blobs, context_hint=context)
+        except Exception as e:
+            log.warning("Vision call failed for %s page %d: %s", path.name, page_num, e)
+            continue
+
+        if not description:
+            continue
+
+        existing = chunk.text.strip()
+        if existing and existing != f"[page {page_num} — no extractable text]":
+            augmented = f"{existing}\n\n[Vision-extracted]\n{description}"
+        else:
+            augmented = f"[Vision-extracted]\n{description}"
+
+        new_chunks[chunk_idx] = Chunk(
+            chunk.chunk_num,
+            chunk.chunk_type,
+            augmented[:MAX_CHARS_PER_CHUNK],
+        )
+        log.info("%s page/slide %d: vision added %d chars", path.name, page_num, len(description))
+
+    return ExtractionResult(result.file_type, new_chunks, result.ocr_used)
+
+
+def _count_pptx_pictures(shapes) -> int:
+    count = 0
+    for shape in shapes:
+        if shape.shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
+            count += 1
+        elif shape.shape_type == 6:  # MSO_SHAPE_TYPE.GROUP
+            try:
+                count += _count_pptx_pictures(shape.shapes)
+            except Exception:
+                pass
+    return count
+
+
+def _extract_pptx(path: Path) -> ExtractionResult:
+    chunks: list[Chunk] = []
+    try:
+        prs = Presentation(path)
+        for i, slide in enumerate(prs.slides, start=1):
+            texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        line = " ".join(r.text for r in para.runs).strip()
+                        if line:
+                            texts.append(line)
+            n_images = _count_pptx_pictures(slide.shapes)
+            chunks.append(Chunk(i, "slide", "\n".join(texts)[:MAX_CHARS_PER_CHUNK], image_count=n_images))
+    except Exception as e:
+        return ExtractionResult("PowerPoint", error=str(e))
+    return ExtractionResult("PowerPoint", chunks=chunks)
+
+
+def _extract_xlsx(path: Path) -> ExtractionResult:
+    chunks: list[Chunk] = []
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        for i, ws in enumerate(wb.worksheets, start=1):
+            rows_text: list[str] = []
+            for j, row in enumerate(ws.iter_rows(values_only=True)):
+                if j >= 200:
+                    break
+                cells = [str(c) for c in row if c is not None]
+                if cells:
+                    rows_text.append("\t".join(cells))
+            chunks.append(Chunk(i, "sheet", "\n".join(rows_text)[:MAX_CHARS_PER_CHUNK]))
+        wb.close()
+    except Exception as e:
+        return ExtractionResult("Excel", error=str(e))
+    return ExtractionResult("Excel", chunks=chunks)
+
+
+_EXTRACTORS = {
+    ".pdf":  _extract_pdf,
+    ".pptx": _extract_pptx,
+    ".xlsx": _extract_xlsx,
+    ".xls":  _extract_xlsx,
+}
+
+FILE_TYPE_LABELS = {
+    ".pdf": "PDF", ".pptx": "PowerPoint", ".xlsx": "Excel", ".xls": "Excel",
+}
+
+
+def extract(path: Path) -> ExtractionResult:
+    ext = path.suffix.lower()
+    fn  = _EXTRACTORS.get(ext)
+    if fn is None:
+        return ExtractionResult(ext.lstrip(".").upper(), error=f"Unsupported type: {ext}")
+    return fn(path)
+
+
+def full_text(result: ExtractionResult) -> str:
+    """Concatenate all chunk text, truncated to MAX_CHARS_PER_DOC."""
+    return "\n\n".join(c.text for c in result.chunks if c.text.strip())[:MAX_CHARS_PER_DOC]
+
+
+# ── Content hashing ───────────────────────────────────────────────────────────
+
+def content_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(65_536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+# ── Duplicate / version detection ────────────────────────────────────────────
+
+_VERSION_RE = re.compile(
+    r"[-_](v\d+|final|draft|revised|updated|new|old|backup)[\s._]",
+    re.IGNORECASE,
+)
+
+def looks_like_version(name: str) -> bool:
+    stem = Path(name).stem
+    return bool(_VERSION_RE.search(stem)) or bool(re.search(r"\(\d+\)$", stem))
+
+
+def find_possible_duplicate(source: str, existing_sources: list[str]) -> Optional[str]:
+    """Return an existing source name that looks like the same file under a different version."""
+    stem = Path(source).stem.lower()
+    # Normalise away version tokens
+    normalised = re.sub(r"[-_](v\d+|final|draft|revised|updated|new|old|\d{4}[-_]\d{2}[-_]\d{2})", "", stem)
+    for existing in existing_sources:
+        e_stem = Path(existing).stem.lower()
+        e_norm = re.sub(r"[-_](v\d+|final|draft|revised|updated|new|old|\d{4}[-_]\d{2}[-_]\d{2})", "", e_stem)
+        if e_norm == normalised and existing != source:
+            return existing
+    return None
+
+
+# ── Single-file ingestion ─────────────────────────────────────────────────────
+
+async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
+    """
+    Ingest one file asynchronously. Returns a status string.
+    Does NOT commit the DB — the caller batches commits.
+    """
+    source = path.name
+
+    # Skip if content hash already in DB
+    h = content_hash(path)
+    if db.hash_exists(h):
+        return f"SKIP  {source} (unchanged)"
+
+    # Ensure the file lives inside DOCS_DIR so file_path is always managed.
+    # If it came from an external path (e.g. CLI with an absolute arg), copy it in.
+    if path.resolve().parent != DOCS_DIR.resolve():
+        DOCS_DIR.mkdir(parents=True, exist_ok=True)
+        dest = DOCS_DIR / path.name
+        if not dest.exists():
+            shutil.copy2(str(path), str(dest))
+        path = dest
+
+    # Extract text chunks
+    result = extract(path)
+    if result.error:
+        entry_id = db.upsert_document(
+            source=source, file_type=result.file_type,
+            ingest_error=result.error, file_path=str(path.resolve()),
+            content_hash=h,
+        )
+        log.warning("Extraction error for %s: %s", source, result.error)
+        return f"ERROR {source}: {result.error}"
+
+    # Vision enrichment: fill in sparse/image-heavy pages with Claude vision
+    result = await _vision_enrich_async(path, result)
+
+    txt = full_text(result)
+    if not txt.strip():
+        entry_id = db.upsert_document(
+            source=source, file_type=result.file_type,
+            ingest_error="No text extracted",
+            file_path=str(path.resolve()), content_hash=h,
+        )
+        return f"EMPTY {source}"
+
+    # Classify with Haiku (async)
+    try:
+        meta = await classify_document_async(source, txt)
+    except Exception as e:
+        meta = {k: "" for k in ["sports_leagues","time_period","doc_type","notes","summary","topics","org_tags","market_tags"]}
+        meta["notes"] = f"Classification failed: {e}"
+        log.warning("Classification failed for %s: %s", source, e)
+
+    # Duplicate / version flag
+    is_dup = 0
+    dup_of = find_possible_duplicate(source, existing_sources)
+    if dup_of or looks_like_version(source):
+        is_dup = 1
+        log.info("Possible duplicate/version: %s (matches %s)", source, dup_of or "pattern")
+
+    # Write to DB
+    entry_id = db.upsert_document(
+        source          = source,
+        entry_date      = meta.get("doc_date", meta.get("time_period", "")),
+        coverage_period = meta.get("coverage_period", ""),
+        file_type       = result.file_type,
+        doc_type        = meta.get("doc_type", ""),
+        org_tags        = meta.get("org_tags", ""),
+        market_tags     = meta.get("market_tags", ""),
+        sport_tags      = meta.get("sports_leagues", ""),
+        topic_tags      = meta.get("topics", ""),
+        summary         = meta.get("summary", ""),
+        notes           = meta.get("notes", ""),
+        file_path       = str(path.resolve()),
+        content_hash    = h,
+        is_duplicate    = is_dup,
+        ocr_used        = int(result.ocr_used),
+        reliability     = meta.get("reliability", "reported"),
+    )
+
+    # Store page/slide chunks
+    db_chunks = [db.Chunk(c.chunk_num, c.chunk_type, c.text) for c in result.chunks]
+    db.store_chunks(entry_id, db_chunks)
+
+    # Update FTS index
+    db.index_entry(entry_id)
+
+    # Resolve and link entities (primary/secondary roles from LLM)
+    try:
+        resolved = await resolve_entities_async(meta)
+        n_entities = 0
+        for r in resolved:
+            canonical = r.get("canonical", "").strip()
+            if canonical:
+                eid = db.find_or_create_entity(
+                    canonical,
+                    r.get("type", "other"),
+                    proposed=bool(r.get("is_new", False)),
+                )
+                db.link_entry_to_entity(entry_id, eid, role=r.get("role", "secondary"))
+                n_entities += 1
+    except Exception as e:
+        log.warning("Entity resolution failed for %s: %s", source, e)
+        n_entities = 0
+
+    # Extract and store structured deals
+    n_deals = 0
+    try:
+        canonical_names = [
+            r.get("canonical", "").strip()
+            for r in resolved
+            if r.get("canonical", "").strip()
+        ]
+        if canonical_names:
+            raw_deals = await extract_deals_async(txt, canonical_names, source_hint=source)
+            for d in raw_deals:
+                en = (d.get("entity_name") or "").strip()
+                entity_row = db.find_entity_by_name_or_alias(en)
+                if entity_row:
+                    confidence   = d.get("confidence", "medium")
+                    entry_rel    = meta.get("reliability", "reported")
+                    deal_status  = "unverified" if confidence == "low" else "current"
+                    db.add_deal(
+                        entity_id       = entity_row["id"],
+                        territory       = d.get("territory", ""),
+                        broadcaster     = d.get("broadcaster", ""),
+                        rights_holder   = d.get("rights_holder", ""),
+                        value           = d.get("value"),
+                        currency        = d.get("currency", ""),
+                        value_note      = d.get("value_note", ""),
+                        period_start    = d.get("period_start", ""),
+                        period_end      = d.get("period_end", ""),
+                        platform        = d.get("platform", ""),
+                        source_entry_id = entry_id,
+                        source_note     = source,
+                        status          = deal_status,
+                        reliability     = entry_rel,
+                    )
+                    n_deals += 1
+    except Exception as e:
+        log.warning("Deal extraction failed for %s: %s", source, e)
+
+    flag = " [possible duplicate]" if is_dup else ""
+    flag += " [OCR]" if result.ocr_used else ""
+    n_vision = sum(1 for c in result.chunks if "[Vision-extracted]" in c.text)
+    flag += f" [vision:{n_vision}]" if n_vision else ""
+    flag += f" ({n_entities} entities, {n_deals} deals)"
+    return f"OK    {source}{flag}"
+
+
+# ── Batch orchestrator ────────────────────────────────────────────────────────
+
+async def ingest_all_async(
+    paths: list[Path],
+    batch_size: int = INGEST_BATCH_SIZE,
+) -> list[str]:
+    """Process `paths` in parallel batches of `batch_size`."""
+    db.init_db()
+    existing_sources = [e["source"] for e in db.get_all_entries()]
+    sem = asyncio.Semaphore(batch_size)
+
+    async def run_one(p: Path) -> str:
+        async with sem:
+            try:
+                return await ingest_file_async(p, existing_sources)
+            except Exception as e:
+                log.error("Unhandled error for %s: %s", p.name, e)
+                return f"FAIL  {p.name}: {e}"
+
+    tasks = [run_one(p) for p in paths]
+    return await asyncio.gather(*tasks)
+
+
+def ingest_directory(docs_dir: Path = DOCS_DIR) -> list[str]:
+    """Synchronous entry-point: ingest all supported files in docs_dir."""
+    supported = {".pdf", ".pptx", ".xlsx", ".xls"}
+    paths = sorted(
+        p for p in docs_dir.iterdir()
+        if p.suffix.lower() in supported and not p.name.startswith(".")
+    )
+    if not paths:
+        return [f"No supported files found in {docs_dir}"]
+    return asyncio.run(ingest_all_async(paths))
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    if len(sys.argv) > 1:
+        targets = [Path(a) for a in sys.argv[1:]]
+        results = asyncio.run(ingest_all_async(targets))
+    else:
+        results = ingest_directory()
+
+    for r in results:
+        print(r)
+
+    ok    = sum(1 for r in results if r.startswith("OK"))
+    skip  = sum(1 for r in results if r.startswith("SKIP"))
+    err   = sum(1 for r in results if r.startswith(("ERROR", "FAIL", "EMPTY")))
+    print(f"\n{ok} ingested  {skip} skipped  {err} errors  (total {len(results)})")

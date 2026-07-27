@@ -1,0 +1,15 @@
+anthropic>=0.105.0
+requests>=2.31.0
+trafilatura>=2.0.0
+lxml_html_clean>=0.4.0
+beautifulsoup4>=4.12.0
+streamlit>=1.50.0
+pandas>=2.0.0
+pdfplumber>=0.11.0
+pymupdf>=1.24.0
+python-pptx>=1.0.0
+openpyxl>=3.1.0
+# OCR (optional — install separately if needed for scanned PDFs)
+# pytesseract>=0.3.10
+# pdf2image>=1.17.0
+Pillow>=10.0.0

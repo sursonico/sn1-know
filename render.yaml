@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: sn1-know
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
+    disk:
+      name: sn1-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: SN1_DB_PATH
+        value: /var/data/knowledge_base.db
+      - key: SN1_DOCS_DIR
+        value: /var/data/sample_docs
