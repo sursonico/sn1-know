@@ -7,12 +7,17 @@ renders its own branded header with custom nav links.
 import hashlib
 import os
 import streamlit as st
+from seed_entities import seed_if_empty
 
 st.set_page_config(
     page_title="SN1 — Media Rights Intelligence",
     page_icon="📋",
     layout="wide",
 )
+
+# Bootstrap canonical entities on first launch so Render deployments do not
+# require shell access for the initial database population.
+seed_if_empty(verbose=False)
 
 # ── Temporary sharing password gate ───────────────────────────────────────────
 # Only active when SN1_SHARE_PASSWORD env var is set. Local dev is unaffected.

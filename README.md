@@ -21,6 +21,7 @@ streamlit run app.py
 
 Set `ANTHROPIC_API_KEY` in your environment for SDK access (faster, parallel ingestion).
 Without it the app falls back to the `claude` CLI.
+If you deploy on Render without shell access, the app seeds the canonical entity list automatically on the first launch.
 
 ## Deploy on Render
 

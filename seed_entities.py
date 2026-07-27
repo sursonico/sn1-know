@@ -79,6 +79,16 @@ def seed(verbose: bool = True) -> int:
     return count
 
 
+def seed_if_empty(verbose: bool = False) -> int:
+    """Seed canonical entities only when the non-proposed entity table is empty."""
+    init_db()
+    from kb.db import get_stats
+
+    if get_stats().get("entities", 0) > 0:
+        return 0
+    return seed(verbose=verbose)
+
+
 if __name__ == "__main__":
     n = seed()
     print(f"\nSeeded {n} entities.")
