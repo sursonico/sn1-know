@@ -22,7 +22,7 @@ st.markdown(
 )
 st.markdown(
     '<p style="color:#7e8e94;font-size:1rem;margin-bottom:1.25rem">'
-    'Search across documents, notes, and entities — or ask a question in plain English.</p>',
+    'Search every document, note and entity in the knowledge base — or ask a question in plain English.</p>',
     unsafe_allow_html=True,
 )
 
