@@ -19,9 +19,17 @@ def load_df() -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    df.fillna("", inplace=True)
+    # Fill blanks only in text columns so numeric dtypes (e.g., float) remain valid.
+    text_cols = [
+        c for c in df.columns
+        if pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_string_dtype(df[c])
+    ]
+    if text_cols:
+        df[text_cols] = df[text_cols].fillna("")
     if "reliability" not in df.columns:
         df["reliability"] = "reported"
+    else:
+        df["reliability"] = df["reliability"].fillna("reported")
     return df
 
 
