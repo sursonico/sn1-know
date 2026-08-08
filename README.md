@@ -98,3 +98,4 @@ Install optional dependencies:
 brew install tesseract
 pip install pytesseract pdf2image Pillow
 ```
+Trigger deploy
