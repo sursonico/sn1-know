@@ -34,6 +34,43 @@ Render is the simplest option here because it supports a mounted disk, which the
 1. Add `SN1_SHARE_PASSWORD` if you want the built-in password gate.
 1. Keep the disk mounted at `/var/data`; the app writes the DB to `/var/data/knowledge_base.db` and uploaded docs to `/var/data/sample_docs`.
 
+### Render persistent disk setup (SQLite + docs)
+
+This app is already configured for Render disk paths in [render.yaml](render.yaml):
+
+- `SN1_DB_PATH=/var/data/knowledge_base.db`
+- `SN1_DOCS_DIR=/var/data/sample_docs`
+
+The blueprint currently sets:
+
+- `plan: starter` (cheapest paid instance that supports persistent disks)
+- `disk.sizeGB: 5`
+
+1. In Render Dashboard, set the service instance type to **Starter**.
+1. Add/confirm a persistent disk on the service:
+    - mount path: `/var/data`
+    - size: `5 GB`
+1. Upload your local `knowledge_base.db` and `sample_docs/` to `/var/data`.
+
+Use the helper script in this repo:
+
+```bash
+chmod +x scripts/render_upload_and_verify.sh
+export RENDER_SSH_HOST="YOUR_SERVICE@ssh.YOUR_REGION.render.com"
+export LOCAL_DB_PATH="/absolute/path/to/knowledge_base.db"
+export LOCAL_DOCS_DIR="/absolute/path/to/sample_docs"
+./scripts/render_upload_and_verify.sh
+```
+
+Equivalent direct commands (if you prefer not to use the script):
+
+```bash
+ssh YOUR_SERVICE@ssh.YOUR_REGION.render.com "mkdir -p /var/data/sample_docs"
+scp -s /absolute/path/to/knowledge_base.db YOUR_SERVICE@ssh.YOUR_REGION.render.com:/var/data/knowledge_base.db
+scp -s -r /absolute/path/to/sample_docs/. YOUR_SERVICE@ssh.YOUR_REGION.render.com:/var/data/sample_docs/
+ssh YOUR_SERVICE@ssh.YOUR_REGION.render.com "ls -lah /var/data && ls -lah /var/data/sample_docs | head"
+```
+
 If you want Railway instead, the app code will work there too, but the persistent disk setup is a little less direct than Render for this SQLite-backed app.
 
 ## Features
