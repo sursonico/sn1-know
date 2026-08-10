@@ -6,11 +6,12 @@ This handles set_page_config, CSS injection, and the branded header + nav.
 """
 
 import base64
+import hashlib
 from pathlib import Path
 
 import streamlit as st
 
-from config import LOGO_PATH, DB_PATH
+from config import LOGO_PATH, DB_PATH, SHARE_PASSWORD
 from kb import db
 
 # ── Type metadata ─────────────────────────────────────────────────────────────
@@ -267,6 +268,73 @@ def inject_styles() -> None:
     st.markdown(_STYLES, unsafe_allow_html=True)
 
 
+def ensure_share_auth() -> None:
+    """Require SN1 share password across all pages when enabled."""
+    if not SHARE_PASSWORD:
+        return
+
+    token = hashlib.sha256(SHARE_PASSWORD.encode()).hexdigest()[:24]
+
+    # Validate via current session, or URL token after full-page nav reload.
+    if not st.session_state.get("_authenticated"):
+        if st.query_params.get("_auth") == token:
+            st.session_state["_authenticated"] = True
+
+    if not st.session_state.get("_authenticated"):
+        st.markdown("""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Open+Sans:wght@300;600;700&display=swap');
+        header[data-testid="stHeader"] { display:none!important; }
+        section[data-testid="stMainBlockContainer"],.block-container {
+            padding-top:0!important; max-width:100%!important;
+        }
+        .gate-wrap { max-width:340px; margin:6rem auto 0; text-align:center; }
+        .gate-logo {
+            font-family:'Open Sans',sans-serif; font-size:1.5rem; font-weight:700;
+            color:#2B383E; letter-spacing:-0.02em; margin-bottom:0.2rem;
+        }
+        .gate-sub {
+            font-family:'Open Sans',sans-serif; font-size:0.78rem; font-weight:300;
+            letter-spacing:0.2em; text-transform:uppercase;
+            color:#8A9598; margin-bottom:2.5rem;
+        }
+        .gate-wrap .stTextInput input {
+            text-align:center; border:1.5px solid #D8D0C4!important;
+            border-radius:6px!important; font-size:1rem!important;
+        }
+        .gate-wrap .stTextInput input:focus {
+            border-color:#AA925C!important;
+            box-shadow:0 0 0 2px rgba(170,146,92,.15)!important;
+        }
+        </style>
+        <div class="gate-wrap">
+          <div class="gate-logo">SN1</div>
+          <div class="gate-sub">Media Rights Intelligence</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.container():
+            col = st.columns([1, 2, 1])[1]
+            pw = col.text_input(
+                "",
+                type="password",
+                placeholder="Access password",
+                key="_gate_pw",
+                label_visibility="collapsed",
+            )
+            if pw:
+                if pw == SHARE_PASSWORD:
+                    st.session_state["_authenticated"] = True
+                    st.session_state["_auth_token"] = token
+                    st.query_params["_auth"] = token
+                    st.rerun()
+                else:
+                    col.error("Incorrect password.")
+        st.stop()
+
+    st.session_state["_auth_token"] = token
+
+
 def render_header(active: str = "home") -> None:
     b64 = _logo_b64()
     logo_html = (
@@ -304,6 +372,7 @@ def page_setup(
     Call at the top of each sub-page.
     Does NOT call st.set_page_config — that is handled by app.py via st.navigation().
     """
+    ensure_share_auth()
     inject_styles()
     db.init_db()
     render_header(active)
