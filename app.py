@@ -7,6 +7,7 @@ renders its own branded header with custom nav links.
 import hashlib
 import os
 import streamlit as st
+from config import SHARE_PASSWORD
 from seed_entities import seed_if_empty
 
 st.set_page_config(
@@ -25,7 +26,7 @@ seed_if_empty(verbose=False)
 # Auth survives page navigation because the token travels as a URL query param.
 # After the user authenticates, all nav links include ?_auth=TOKEN so that each
 # full-page reload (from <a href> nav) re-validates without re-prompting.
-_SHARE_PW = os.environ.get("SN1_SHARE_PASSWORD", "")
+_SHARE_PW = SHARE_PASSWORD
 if _SHARE_PW:
     _TOKEN = hashlib.sha256(_SHARE_PW.encode()).hexdigest()[:24]
 

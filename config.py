@@ -34,6 +34,9 @@ STAGE2_BROAD_MAX_CHUNKS    = 160  # max chunks for exhaustive/list questions ("a
 STAGE2_MULTISOURCE_MAX_CHUNKS = 120  # raised budget when a question spans 3+ distinct sources
 CONVERSATION_HISTORY  = 2       # prior turns included in follow-up context
 
+# ── Access ────────────────────────────────────────────────────────────────
+SHARE_PASSWORD = os.getenv("SN1_SHARE_PASSWORD", "")
+
 # ── Brand ───────────────────────────────────────────────────────────────────
 BRAND_NAVY  = "#2B383E"
 BRAND_GOLD  = "#AA925C"
