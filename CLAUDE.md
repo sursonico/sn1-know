@@ -98,6 +98,25 @@ the seed list. The Admin page shows a review queue for these.
 3. **Stage 2** — load chunks for selected entries → `generate_answer()` (Sonnet)
 4. Citations: `[filename.pdf, p.4]` or `[logged note — 2026-06-10, Source]`
 
+### Stage 1 robustness
+`select_relevant_entries()` returns a `Stage1Result` with a `mode`:
+`selected` · `salvaged` (JSON truncated/malformed but IDs recovered) · `empty`
+(model validly found nothing) · `fallback_all` (both attempts failed → sweep the
+catalogue, FTS hits first). A malformed reply is **retried once** with a stricter
+instruction before falling back, `max_tokens` is high enough that the JSON isn't
+cut off mid-array, and every failure is logged *and* returned on `.error`/`.raw`
+so Ask can show what actually came back instead of a silent "parse failed".
+
+### Page selection (Stage 2)
+`_allocate_chunks()` picks pages **globally by relevance**, not per-source in
+document order: each source keeps one anchor page, then the whole remaining
+budget is contested by keyword score across every source, and anything left is
+filled round-robin. This is what makes the `fallback_all` sweep usable — 20
+sources no longer each spend their quota on their own front matter, so a matching
+slide 31 beats slide 2 of an unrelated deck. Question terms include season
+variants (`2025/26` also matches `2025-26`, `2025/2026`). Budgets live in
+config: `STAGE2_MAX_CHUNKS` → broad → multisource → `STAGE2_FALLBACK_MAX_CHUNKS`.
+
 ## Conventions
 - All DB access via `kb/db.py`. No raw sqlite3 elsewhere.
 - All LLM calls via `kb/llm.py` (SDK if `ANTHROPIC_API_KEY`, else `claude` CLI).

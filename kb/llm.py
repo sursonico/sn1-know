@@ -41,6 +41,9 @@ def call_claude(
     result = subprocess.run(
         ["claude", "-p", f"{system}\n\n{user}", "--output-format", "text"],
         capture_output=True, text=True, timeout=timeout,
+        # Without this the CLI waits on inherited stdin for 3s and can exit
+        # non-zero under Streamlit — which surfaced as a Stage 1 "failure".
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
         raise RuntimeError(f"claude CLI: {result.stderr.strip()[:200]}")
@@ -279,7 +282,7 @@ def classify_document(filename: str, text: str) -> dict:
         f"Filename: {filename}\n\nText excerpt:\n\n{text}",
         model=CLASSIFY_MODEL, max_tokens=700,
     )
-    return _parse_json(raw, _CLASSIFY_FALLBACK)
+    return _parse_json(raw, _CLASSIFY_FALLBACK, "classify_document")
 
 
 async def classify_document_async(filename: str, text: str) -> dict:
@@ -310,7 +313,7 @@ def enrich_document(filename: str, text: str) -> dict:
         f"Filename: {filename}\n\nText excerpt:\n\n{text}",
         model=CLASSIFY_MODEL, max_tokens=400,
     )
-    return _parse_json(raw, {"summary": "", "topics": ""})
+    return _parse_json(raw, {"summary": "", "topics": ""}, "enrich_document")
 
 
 # ── Snippet enrichment ────────────────────────────────────────────────────────
@@ -793,7 +796,7 @@ def check_new_entry_conflicts(
         _CONFLICT_CHECK_SYSTEM, user_msg,
         model=CLASSIFY_MODEL, max_tokens=600,
     )
-    return _parse_json(raw, {"has_conflict": False, "conflicts": [], "summary": ""})
+    return _parse_json(raw, {"has_conflict": False, "conflicts": [], "summary": ""}, "check_conflicts")
 
 
 # ── Deal extraction ───────────────────────────────────────────────────────────
