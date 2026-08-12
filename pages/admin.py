@@ -1,10 +1,12 @@
 """Entity admin page — /admin"""
 import streamlit as st
+from config import DELETED_RETENTION_DAYS
 from kb.ui import page_setup, section_title, entity_type_badge, ENTITY_TYPE_META
 from kb.db import (
     get_all_entities, get_proposed_entities, get_entity, get_entity_stats,
     update_entity, merge_entities, upsert_entity, index_entry,
-    get_entries_for_entity,
+    get_entries_for_entity, get_deleted_entries, restore_entry, purge_entry,
+    get_purgeable_entry_ids, purge_expired_deleted,
 )
 from seed_entities import seed
 
@@ -21,8 +23,14 @@ with st.expander("Bootstrap canonical entities", expanded=False):
         st.success(f"Seeded {n} canonical entities.")
         st.rerun()
 
-tab_active, tab_proposed, tab_cleanup, tab_create = st.tabs([
-    "Active Entities", "Proposed (Pending Review)", "Cleanup — No Entries", "Create New"
+_deleted_entries = get_deleted_entries()
+_deleted_label = (
+    f"Recently Deleted ({len(_deleted_entries)})" if _deleted_entries else "Recently Deleted"
+)
+
+tab_active, tab_proposed, tab_cleanup, tab_create, tab_deleted = st.tabs([
+    "Active Entities", "Proposed (Pending Review)", "Cleanup — No Entries", "Create New",
+    _deleted_label,
 ])
 
 # ── Active entities ───────────────────────────────────────────────────────────
@@ -181,3 +189,91 @@ with tab_create:
         eid = upsert_entity(new_name.strip(), new_type, new_aliases.strip(), is_proposed=0)
         st.success(f"Created entity '{new_name}' (id={eid})")
         st.rerun()
+
+
+# ── Recently deleted: restore or purge ────────────────────────────────────────
+with tab_deleted:
+    section_title("Recently deleted entries")
+    st.caption(
+        f"Entries deleted from Browse are hidden from Browse, Ask and every entity hub, "
+        f"but the record — plus any deal rows and proposed entities extracted from it — "
+        f"is kept and can be restored here. Nothing is removed automatically; after "
+        f"{DELETED_RETENTION_DAYS} days an entry becomes eligible for permanent purge. "
+        f"Purging never deletes the original file from disk."
+    )
+
+    if not _deleted_entries:
+        st.success("Nothing in the recycle bin.")
+    else:
+        expired_ids = set(get_purgeable_entry_ids(DELETED_RETENTION_DAYS))
+        if expired_ids:
+            st.warning(
+                f"{len(expired_ids)} entr{'y is' if len(expired_ids) == 1 else 'ies are'} "
+                f"past the {DELETED_RETENTION_DAYS}-day window and eligible for permanent purge."
+            )
+            if st.button(
+                f"Purge all {len(expired_ids)} expired permanently",
+                key="purge_expired",
+                type="secondary",
+            ):
+                n = purge_expired_deleted(DELETED_RETENTION_DAYS)
+                st.success(f"Permanently purged {n} entr{'y' if n == 1 else 'ies'}.")
+                st.rerun()
+
+        st.write(f"**{len(_deleted_entries)} deleted entr{'y' if len(_deleted_entries) == 1 else 'ies'}:**")
+        for entry in _deleted_entries:
+            eid       = entry["id"]
+            source    = entry.get("source") or "(untitled)"
+            days      = entry.get("days_deleted") or 0
+            when      = (entry.get("deleted_at") or "")[:10]
+            expired   = eid in expired_ids
+            age_label = "today" if days < 1 else f"{days} day{'s' if days != 1 else ''} ago"
+            marker    = "⚠ " if expired else ""
+
+            with st.expander(f"{marker}{source}  —  deleted {age_label}"):
+                bits = [
+                    f"Type: {entry.get('entry_type', '?')}",
+                    f"Deleted: {when}",
+                ]
+                if entry.get("entry_date"):
+                    bits.append(f"Date: {entry['entry_date']}")
+                if entry.get("held_deals"):
+                    bits.append(f"{entry['held_deals']} deal row(s) held")
+                if entry.get("held_entities"):
+                    bits.append(f"{entry['held_entities']} proposed entity/entities held")
+                st.caption("  ·  ".join(bits))
+                if entry.get("summary"):
+                    st.write(entry["summary"][:400])
+
+                if expired:
+                    st.caption(
+                        f"Past the {DELETED_RETENTION_DAYS}-day retention window — eligible for purge."
+                    )
+                else:
+                    st.caption(
+                        f"Recoverable for {max(DELETED_RETENTION_DAYS - days, 0)} more day(s)."
+                    )
+
+                col_r, col_p = st.columns(2)
+                if col_r.button("Restore", key=f"restore_{eid}", type="primary"):
+                    if restore_entry(eid):
+                        st.success(f"Restored '{source}' — it is back in Browse and Ask.")
+                    else:
+                        st.warning("That entry is no longer in the recycle bin.")
+                    st.rerun()
+
+                confirm_key = f"purge_confirm_{eid}"
+                confirmed = col_p.checkbox(
+                    "Confirm permanent purge", key=confirm_key,
+                    help="Removes the record, its pages, index rows and held deals for good. "
+                         "The source file on disk is not touched.",
+                )
+                if col_p.button(
+                    "Purge permanently", key=f"purge_{eid}",
+                    type="secondary", disabled=not confirmed,
+                ):
+                    if purge_entry(eid):
+                        st.success(f"Permanently purged '{source}'.")
+                    else:
+                        st.warning("That entry is no longer in the recycle bin.")
+                    st.rerun()

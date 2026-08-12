@@ -22,10 +22,10 @@ kb/
   ui.py             — shared Streamlit utilities: styles, nav, components
 pages/
   entity.py         — entity hub (overview, linked entries, scoped Ask)
-  browse.py         — browse & filter table
+  browse.py         — browse & filter table + per-row soft delete
   ask.py            — global Ask (FTS + two-stage retrieval)
   add_log.py        — Add Documents + Log Snippet
-  admin.py          — entity rename, merge, alias editing
+  admin.py          — entity rename, merge, alias editing, recycle bin
 sample_docs/        — source files (gitignored)
 ```
 
@@ -34,7 +34,8 @@ sample_docs/        — source files (gitignored)
 entries        id · entry_type · source · entry_date · file_type · doc_type
                org_tags · market_tags · sport_tags · topic_tags
                summary · notes · file_path · content_hash
-               is_duplicate · ocr_used · ingest_error · created_at · updated_at
+               is_duplicate · ocr_used · ingest_error · deleted_at
+               created_at · updated_at
 
 chunks         id · entry_id (→entries) · chunk_num · chunk_type · text
                (one row per PDF page / PPTX slide / XLSX sheet / snippet body)
@@ -43,10 +44,36 @@ search_idx     FTS5 virtual table — porter tokenizer
 search_idx_map rowid → entry_id + optional chunk_id
 
 entities       id · canonical_name · entity_type · aliases · is_proposed
-               overview · overview_at · created_at · updated_at
+               overview · overview_at · deleted_at · deleted_with_entry
+               created_at · updated_at
 
 entry_entities entry_id (→entries) · entity_id (→entities)  [many-to-many]
+
+deals          id · entity_id (→entities) · territory · broadcaster · rights_holder
+               value · currency · period_start · period_end · platform
+               source_entry_id (→entries) · status · reliability
+               deleted_at · deleted_with_entry
 ```
+
+## Soft deletion
+Deleting from Browse never removes a row or the source file — it stamps
+`deleted_at` and cascades to everything extracted from that entry:
+
+- **deals** with `source_entry_id = entry` → `deleted_at` + `deleted_with_entry`
+- **proposed entities** left with no other live source → same two columns
+  (seeded/accepted entities are a curated registry and are never touched)
+
+Every read in `kb/db.py` filters `deleted_at IS NULL`, including `fts_search()`
+(which joins `entries`), so deleted content disappears from Browse, Ask/retrieval,
+entity hubs and stats. FTS index rows are deliberately left in place so a restore
+needs no re-indexing.
+
+`restore_entry()` reverses a delete exactly, using `deleted_with_entry` to know
+what to bring back. Re-ingesting a deleted file revives it the same way.
+Admin → Recently Deleted lists the bin with restore + permanent purge;
+`purge_entry()` is the only destructive path and still leaves the file on disk.
+`DELETED_RETENTION_DAYS` (config, default 30) is the recovery window — nothing is
+purged automatically.
 
 ## Entity model
 **Entity types:** competition | federation | broadcaster | market | rights_holder | club | other

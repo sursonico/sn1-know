@@ -8,6 +8,14 @@ Schema:
   search_idx_map — maps FTS rowid → entry_id + optional chunk_id
   entities       — canonical entity registry (competitions, broadcasters, …)
   entry_entities — many-to-many link between entries and entities
+  deals          — structured broadcaster/territory rows extracted from entries
+
+Soft deletion:
+  entries, deals and entities all carry a `deleted_at` timestamp. Every read in
+  this module filters `deleted_at IS NULL`, so a soft-deleted row disappears from
+  Browse, Ask/retrieval, entity hubs and stats while the record (and the original
+  file on disk) survives. Rows cascaded out by an entry deletion also record
+  `deleted_with_entry`, which is what `restore_entry()` uses to put them back.
 """
 
 import sqlite3
@@ -42,6 +50,7 @@ CREATE TABLE IF NOT EXISTS entries (
     ingest_error   TEXT          DEFAULT '',
     status         TEXT          DEFAULT 'current',
     superseded_by  INTEGER       REFERENCES entries(id),
+    deleted_at     TEXT,
     created_at     TEXT          DEFAULT (datetime('now')),
     updated_at     TEXT          DEFAULT (datetime('now'))
 );
@@ -69,6 +78,8 @@ CREATE TABLE IF NOT EXISTS entities (
     is_featured    INTEGER       DEFAULT 0,
     overview       TEXT          DEFAULT '',
     overview_at    TEXT          DEFAULT '',
+    deleted_at     TEXT,
+    deleted_with_entry INTEGER,
     created_at     TEXT          DEFAULT (datetime('now')),
     updated_at     TEXT          DEFAULT (datetime('now')),
     UNIQUE(canonical_name COLLATE NOCASE)
@@ -106,6 +117,8 @@ CREATE TABLE IF NOT EXISTS deals (
     source_note     TEXT    DEFAULT '',
     status          TEXT    DEFAULT 'current',
     superseded_by   INTEGER REFERENCES deals(id),
+    deleted_at      TEXT,
+    deleted_with_entry INTEGER,
     date_added      TEXT    DEFAULT (datetime('now')),
     updated_at      TEXT    DEFAULT (datetime('now'))
 );
@@ -166,25 +179,42 @@ def init_db(path: Path = DB_PATH) -> None:
         # Live migration: add coverage_period to entries if missing
         if "coverage_period" not in e_cols:
             con.execute("ALTER TABLE entries ADD COLUMN coverage_period TEXT DEFAULT ''")
+        # Live migration: soft-delete columns (entries, deals, entities)
+        if "deleted_at" not in e_cols:
+            con.execute("ALTER TABLE entries ADD COLUMN deleted_at TEXT")
+        if "deleted_at" not in d_cols:
+            con.execute("ALTER TABLE deals ADD COLUMN deleted_at TEXT")
+        if "deleted_with_entry" not in d_cols:
+            con.execute("ALTER TABLE deals ADD COLUMN deleted_with_entry INTEGER")
+        if "deleted_at" not in ent_cols:
+            con.execute("ALTER TABLE entities ADD COLUMN deleted_at TEXT")
+        if "deleted_with_entry" not in ent_cols:
+            con.execute("ALTER TABLE entities ADD COLUMN deleted_with_entry INTEGER")
 
 
 # ── Entry reads ─────────────────────────────────────────────────────────────
 
 def get_all_entries(path: Path = DB_PATH) -> list[dict]:
+    """All live (non-deleted) entries."""
     with _conn(path) as con:
         rows = con.execute(
-            "SELECT * FROM entries ORDER BY entry_type, created_at"
+            "SELECT * FROM entries WHERE deleted_at IS NULL ORDER BY entry_type, created_at"
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_entries_by_ids(ids: list[int], path: Path = DB_PATH) -> list[dict]:
+def get_entries_by_ids(
+    ids: list[int],
+    include_deleted: bool = False,
+    path: Path = DB_PATH,
+) -> list[dict]:
     if not ids:
         return []
     ph = ",".join("?" * len(ids))
+    del_filter = "" if include_deleted else " AND deleted_at IS NULL"
     with _conn(path) as con:
         rows = con.execute(
-            f"SELECT * FROM entries WHERE id IN ({ph})", list(ids)
+            f"SELECT * FROM entries WHERE id IN ({ph}){del_filter}", list(ids)
         ).fetchall()
         id_order = {v: i for i, v in enumerate(ids)}
         return sorted([dict(r) for r in rows], key=lambda r: id_order.get(r["id"], 999))
@@ -197,6 +227,7 @@ def get_entries_needing_enrichment(path: Path = DB_PATH) -> list[dict]:
             WHERE entry_type='document'
               AND (summary='' OR topic_tags='')
               AND ingest_error=''
+              AND deleted_at IS NULL
             ORDER BY created_at
         """).fetchall()
         return [dict(r) for r in rows]
@@ -207,7 +238,8 @@ def hash_exists(content_hash: str, path: Path = DB_PATH) -> bool:
         return False
     with _conn(path) as con:
         n = con.execute(
-            "SELECT COUNT(*) FROM entries WHERE content_hash=?", (content_hash,)
+            "SELECT COUNT(*) FROM entries WHERE content_hash=? AND deleted_at IS NULL",
+            (content_hash,),
         ).fetchone()[0]
         return n > 0
 
@@ -275,11 +307,15 @@ def fts_search(question: str, limit: int = 20, path: Path = DB_PATH) -> list[int
 
     with _conn(path) as con:
         try:
+            # Join entries so soft-deleted sources never surface as candidates —
+            # the index rows are left in place so a restore needs no re-indexing.
             rows = con.execute("""
                 SELECT DISTINCT m.entry_id
                 FROM search_idx s
                 JOIN search_idx_map m ON s.rowid = m.rowid
+                JOIN entries en       ON en.id   = m.entry_id
                 WHERE search_idx MATCH ?
+                  AND en.deleted_at IS NULL
                 ORDER BY s.rank
                 LIMIT ?
             """, (fts_query, limit * 4)).fetchall()
@@ -321,12 +357,20 @@ def upsert_document(
     reliability: str = "reported",
     path: Path = DB_PATH,
 ) -> int:
-    """Insert or update a document entry, keyed on source (filename)."""
+    """
+    Insert or update a document entry, keyed on source (filename).
+
+    If the matching entry was soft-deleted, re-ingesting the same source revives
+    it along with the deal rows and entities that were cascaded out with it.
+    """
     with _conn(path) as con:
         existing = con.execute(
-            "SELECT id FROM entries WHERE entry_type='document' AND source=?", (source,)
+            "SELECT id, deleted_at FROM entries WHERE entry_type='document' AND source=?",
+            (source,),
         ).fetchone()
         if existing:
+            if existing["deleted_at"]:
+                _undelete_cascade(con, existing["id"])
             con.execute("""
                 UPDATE entries SET
                     entry_date=?, coverage_period=?, file_type=?, doc_type=?,
@@ -482,18 +526,23 @@ def index_entry(entry_id: int, path: Path = DB_PATH) -> None:
 
 def get_stats(path: Path = DB_PATH) -> dict:
     with _conn(path) as con:
-        total = con.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        total = con.execute(
+            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL"
+        ).fetchone()[0]
         docs  = con.execute(
-            "SELECT COUNT(*) FROM entries WHERE entry_type='document'"
+            "SELECT COUNT(*) FROM entries WHERE entry_type='document' AND deleted_at IS NULL"
         ).fetchone()[0]
         snips = con.execute(
-            "SELECT COUNT(*) FROM entries WHERE entry_type='snippet'"
+            "SELECT COUNT(*) FROM entries WHERE entry_type='snippet' AND deleted_at IS NULL"
         ).fetchone()[0]
         recent = con.execute("""
             SELECT source, entry_type, created_at FROM entries
+            WHERE deleted_at IS NULL
             ORDER BY created_at DESC LIMIT 10
         """).fetchall()
-        n_entities = con.execute("SELECT COUNT(*) FROM entities WHERE is_proposed=0").fetchone()[0]
+        n_entities = con.execute(
+            "SELECT COUNT(*) FROM entities WHERE is_proposed=0 AND deleted_at IS NULL"
+        ).fetchone()[0]
         return {
             "total": total, "documents": docs, "snippets": snips,
             "entities": n_entities,
@@ -510,13 +559,23 @@ def upsert_entity(
     is_proposed: int = 0,
     path: Path = DB_PATH,
 ) -> int:
-    """Insert entity if it doesn't exist; return its ID either way."""
+    """
+    Insert entity if it doesn't exist; return its ID either way.
+    A soft-deleted entity with the same name is revived rather than duplicated
+    (canonical_name is UNIQUE).
+    """
     with _conn(path) as con:
         row = con.execute(
-            "SELECT id FROM entities WHERE canonical_name=? COLLATE NOCASE",
+            "SELECT id, deleted_at FROM entities WHERE canonical_name=? COLLATE NOCASE",
             (canonical_name,),
         ).fetchone()
         if row:
+            if row["deleted_at"]:
+                con.execute(
+                    "UPDATE entities SET deleted_at=NULL, deleted_with_entry=NULL,"
+                    " updated_at=datetime('now') WHERE id=?",
+                    (row["id"],),
+                )
             return row["id"]
         cur = con.execute(
             "INSERT INTO entities (canonical_name, entity_type, aliases, is_proposed) VALUES (?,?,?,?)",
@@ -525,18 +584,25 @@ def upsert_entity(
         return cur.lastrowid
 
 
-def find_entity_by_name_or_alias(name: str, path: Path = DB_PATH) -> Optional[dict]:
+def find_entity_by_name_or_alias(
+    name: str,
+    include_deleted: bool = False,
+    path: Path = DB_PATH,
+) -> Optional[dict]:
     """Return the entity row whose canonical_name or any alias matches `name` (case-insensitive)."""
     name_lo = name.strip().lower()
+    del_filter = "" if include_deleted else " AND deleted_at IS NULL"
     with _conn(path) as con:
         # Exact canonical match
         row = con.execute(
-            "SELECT * FROM entities WHERE LOWER(canonical_name)=?", (name_lo,)
+            f"SELECT * FROM entities WHERE LOWER(canonical_name)=?{del_filter}", (name_lo,)
         ).fetchone()
         if row:
             return dict(row)
         # Alias scan (comma-separated aliases column)
-        rows = con.execute("SELECT * FROM entities").fetchall()
+        rows = con.execute(
+            f"SELECT * FROM entities WHERE 1=1{del_filter}"
+        ).fetchall()
         for r in rows:
             aliases = [a.strip().lower() for a in (r["aliases"] or "").split(",") if a.strip()]
             if name_lo in aliases:
@@ -550,9 +616,14 @@ def find_or_create_entity(
     proposed: bool = False,
     path: Path = DB_PATH,
 ) -> int:
-    """Find entity by name/alias; create (optionally as proposed) if not found."""
-    existing = find_entity_by_name_or_alias(canonical_name, path)
+    """
+    Find entity by name/alias; create (optionally as proposed) if not found.
+    A soft-deleted match is revived — a new source mentioning it brings it back.
+    """
+    existing = find_entity_by_name_or_alias(canonical_name, include_deleted=True, path=path)
     if existing:
+        if existing.get("deleted_at"):
+            update_entity(existing["id"], path=path, deleted_at=None, deleted_with_entry=None)
         return existing["id"]
     return upsert_entity(canonical_name, entity_type, "", int(proposed), path)
 
@@ -562,9 +633,9 @@ def get_all_entities(
     path: Path = DB_PATH,
 ) -> list[dict]:
     with _conn(path) as con:
-        q = "SELECT * FROM entities"
+        q = "SELECT * FROM entities WHERE deleted_at IS NULL"
         if not include_proposed:
-            q += " WHERE is_proposed=0"
+            q += " AND is_proposed=0"
         q += " ORDER BY canonical_name COLLATE NOCASE"
         return [dict(r) for r in con.execute(q).fetchall()]
 
@@ -620,7 +691,7 @@ def get_entities_for_entry(entry_id: int, path: Path = DB_PATH) -> list[dict]:
         rows = con.execute("""
             SELECT e.* FROM entities e
             JOIN entry_entities ee ON ee.entity_id = e.id
-            WHERE ee.entry_id = ?
+            WHERE ee.entry_id = ? AND e.deleted_at IS NULL
             ORDER BY e.canonical_name COLLATE NOCASE
         """, (entry_id,)).fetchall()
         return [dict(r) for r in rows]
@@ -636,7 +707,7 @@ def get_entries_for_entity(
         rows = con.execute(f"""
             SELECT en.* FROM entries en
             JOIN entry_entities ee ON ee.entry_id = en.id
-            WHERE ee.entity_id = ? {status_filter}
+            WHERE ee.entity_id = ? AND en.deleted_at IS NULL {status_filter}
             ORDER BY en.entry_date DESC, en.created_at DESC
         """, (entity_id,)).fetchall()
         return [dict(r) for r in rows]
@@ -679,6 +750,7 @@ def get_recent_entries_for_entities(
             FROM entries en
             JOIN entry_entities ee ON ee.entry_id = en.id
             WHERE ee.entity_id IN ({ph})
+              AND en.deleted_at IS NULL
               AND en.status != 'superseded'
             ORDER BY en.entry_date DESC, en.created_at DESC
             LIMIT ?
@@ -702,8 +774,8 @@ def get_entity_stats(path: Path = DB_PATH) -> list[dict]:
                 MAX(en.created_at) AS last_updated
             FROM entities e
             LEFT JOIN entry_entities ee ON ee.entity_id = e.id
-            LEFT JOIN entries en        ON en.id = ee.entry_id
-            WHERE e.is_proposed = 0
+            LEFT JOIN entries en        ON en.id = ee.entry_id AND en.deleted_at IS NULL
+            WHERE e.is_proposed = 0 AND e.deleted_at IS NULL
             GROUP BY e.id
             ORDER BY total_count DESC, e.canonical_name COLLATE NOCASE
         """).fetchall()
@@ -713,7 +785,8 @@ def get_entity_stats(path: Path = DB_PATH) -> list[dict]:
 def get_proposed_entities(path: Path = DB_PATH) -> list[dict]:
     with _conn(path) as con:
         rows = con.execute(
-            "SELECT * FROM entities WHERE is_proposed=1 ORDER BY created_at DESC"
+            "SELECT * FROM entities WHERE is_proposed=1 AND deleted_at IS NULL"
+            " ORDER BY created_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -742,6 +815,7 @@ def add_deal(
         existing = con.execute("""
             SELECT id FROM deals
             WHERE entity_id=?
+              AND deleted_at IS NULL
               AND LOWER(TRIM(territory))=LOWER(TRIM(?))
               AND LOWER(TRIM(broadcaster))=LOWER(TRIM(?))
               AND TRIM(period_start)=TRIM(?)
@@ -774,7 +848,7 @@ def get_deals_for_entity(
         status_filter = "" if include_superseded else "AND status != 'superseded'"
         rows = con.execute(f"""
             SELECT * FROM deals
-            WHERE entity_id = ? {status_filter}
+            WHERE entity_id = ? AND deleted_at IS NULL {status_filter}
             ORDER BY date_added DESC
         """, (entity_id,)).fetchall()
         return [dict(r) for r in rows]
@@ -795,7 +869,8 @@ def get_deals_for_entities(
             SELECT d.*, e.canonical_name AS entity_name
             FROM deals d
             JOIN entities e ON d.entity_id = e.id
-            WHERE d.entity_id IN ({ph}) {status_filter}
+            WHERE d.entity_id IN ({ph})
+              AND d.deleted_at IS NULL AND e.deleted_at IS NULL {status_filter}
             ORDER BY e.canonical_name COLLATE NOCASE, d.territory COLLATE NOCASE
         """, list(entity_ids)).fetchall()
     return [dict(r) for r in rows]
@@ -803,7 +878,9 @@ def get_deals_for_entities(
 
 def get_deal(deal_id: int, path: Path = DB_PATH) -> Optional[dict]:
     with _conn(path) as con:
-        row = con.execute("SELECT * FROM deals WHERE id=?", (deal_id,)).fetchone()
+        row = con.execute(
+            "SELECT * FROM deals WHERE id=? AND deleted_at IS NULL", (deal_id,)
+        ).fetchone()
         return dict(row) if row else None
 
 
@@ -835,8 +912,232 @@ def find_conflicting_deal_territories(entity_id: int, path: Path = DB_PATH) -> s
         rows = con.execute("""
             SELECT LOWER(TRIM(territory)) as t, COUNT(*) as n
             FROM deals
-            WHERE entity_id=? AND status='current' AND TRIM(territory) != ''
+            WHERE entity_id=? AND status='current' AND deleted_at IS NULL
+              AND TRIM(territory) != ''
             GROUP BY LOWER(TRIM(territory))
             HAVING n > 1
         """, (entity_id,)).fetchall()
         return {r["t"] for r in rows}
+
+
+# ── Soft delete / restore / purge ─────────────────────────────────────────────
+
+def _orphaned_proposed_entities(con, entry_id: int, entry_still_live: bool) -> list[dict]:
+    """
+    Proposed entities linked to `entry_id` that would have no live source left once
+    the entry is gone. Seeded/accepted entities are never touched — they are a
+    curated registry, not per-document extractions.
+
+    `entry_still_live` tells us whether the entry itself must be discounted when
+    checking for remaining sources (True when previewing an impending delete).
+    """
+    exclude = "AND en.id != ?" if entry_still_live else ""
+    params = [entry_id, entry_id] if entry_still_live else [entry_id]
+    rows = con.execute(f"""
+        SELECT e.id, e.canonical_name, e.entity_type
+        FROM entities e
+        JOIN entry_entities ee ON ee.entity_id = e.id
+        WHERE ee.entry_id = ?
+          AND e.is_proposed = 1
+          AND e.deleted_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM entry_entities ee2
+              JOIN entries en ON en.id = ee2.entry_id
+              WHERE ee2.entity_id = e.id AND en.deleted_at IS NULL {exclude}
+          )
+    """, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_delete_impact(entry_id: int, path: Path = DB_PATH) -> Optional[dict]:
+    """
+    Preview what a soft delete of `entry_id` would remove from view.
+
+    Returns None if the entry doesn't exist or is already deleted, else:
+      {"entry": row, "chunks": int, "deals": int, "entities": [{id, canonical_name, entity_type}]}
+    """
+    with _conn(path) as con:
+        row = con.execute(
+            "SELECT * FROM entries WHERE id=? AND deleted_at IS NULL", (entry_id,)
+        ).fetchone()
+        if not row:
+            return None
+        n_chunks = con.execute(
+            "SELECT COUNT(*) FROM chunks WHERE entry_id=?", (entry_id,)
+        ).fetchone()[0]
+        n_deals = con.execute(
+            "SELECT COUNT(*) FROM deals WHERE source_entry_id=? AND deleted_at IS NULL",
+            (entry_id,),
+        ).fetchone()[0]
+        return {
+            "entry":    dict(row),
+            "chunks":   n_chunks,
+            "deals":    n_deals,
+            "entities": _orphaned_proposed_entities(con, entry_id, entry_still_live=True),
+        }
+
+
+def soft_delete_entry(entry_id: int, path: Path = DB_PATH) -> dict:
+    """
+    Mark an entry deleted, cascading to everything extracted from it:
+      • deal rows whose source_entry_id is this entry
+      • proposed entities left with no other live source
+
+    Nothing is removed from disk or from the tables — `restore_entry()` reverses
+    it exactly. Returns {"deals": int, "entities": [names]}; both empty if the
+    entry was already deleted or does not exist.
+    """
+    with _conn(path) as con:
+        row = con.execute(
+            "SELECT id FROM entries WHERE id=? AND deleted_at IS NULL", (entry_id,)
+        ).fetchone()
+        if not row:
+            return {"deals": 0, "entities": []}
+
+        con.execute(
+            "UPDATE entries SET deleted_at=datetime('now'), updated_at=datetime('now')"
+            " WHERE id=?",
+            (entry_id,),
+        )
+        cur = con.execute("""
+            UPDATE deals
+            SET deleted_at=datetime('now'), deleted_with_entry=?, updated_at=datetime('now')
+            WHERE source_entry_id=? AND deleted_at IS NULL
+        """, (entry_id, entry_id))
+        n_deals = cur.rowcount
+
+        # The entry is already flagged above, so remaining-source checks see the
+        # post-delete world — no need to discount it again.
+        orphans = _orphaned_proposed_entities(con, entry_id, entry_still_live=False)
+        for ent in orphans:
+            con.execute(
+                "UPDATE entities SET deleted_at=datetime('now'), deleted_with_entry=?,"
+                " updated_at=datetime('now') WHERE id=?",
+                (entry_id, ent["id"]),
+            )
+        return {"deals": n_deals, "entities": [e["canonical_name"] for e in orphans]}
+
+
+def _undelete_cascade(con, entry_id: int) -> None:
+    """Clear deleted_at on an entry and everything cascaded out with it."""
+    con.execute(
+        "UPDATE entries SET deleted_at=NULL, updated_at=datetime('now') WHERE id=?",
+        (entry_id,),
+    )
+    con.execute(
+        "UPDATE deals SET deleted_at=NULL, deleted_with_entry=NULL,"
+        " updated_at=datetime('now') WHERE deleted_with_entry=?",
+        (entry_id,),
+    )
+    con.execute(
+        "UPDATE entities SET deleted_at=NULL, deleted_with_entry=NULL,"
+        " updated_at=datetime('now') WHERE deleted_with_entry=?",
+        (entry_id,),
+    )
+
+
+def restore_entry(entry_id: int, path: Path = DB_PATH) -> bool:
+    """Undo a soft delete, bringing back cascaded deals and entities. False if not deleted."""
+    with _conn(path) as con:
+        row = con.execute(
+            "SELECT id FROM entries WHERE id=? AND deleted_at IS NOT NULL", (entry_id,)
+        ).fetchone()
+        if not row:
+            return False
+        _undelete_cascade(con, entry_id)
+        return True
+
+
+def get_deleted_entries(path: Path = DB_PATH) -> list[dict]:
+    """
+    Soft-deleted entries, most recently deleted first, each annotated with
+    `days_deleted` and the number of deal/entity rows held with it.
+    """
+    with _conn(path) as con:
+        rows = con.execute("""
+            SELECT en.*,
+                   CAST(julianday('now') - julianday(en.deleted_at) AS INTEGER) AS days_deleted,
+                   (SELECT COUNT(*) FROM deals d
+                     WHERE d.deleted_with_entry = en.id AND d.deleted_at IS NOT NULL) AS held_deals,
+                   (SELECT COUNT(*) FROM entities e
+                     WHERE e.deleted_with_entry = en.id AND e.deleted_at IS NOT NULL) AS held_entities
+            FROM entries en
+            WHERE en.deleted_at IS NOT NULL
+            ORDER BY en.deleted_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def purge_entry(entry_id: int, path: Path = DB_PATH) -> bool:
+    """
+    Permanently remove a soft-deleted entry: its chunks, FTS index rows, entity
+    links, and the deal/entity rows that were cascaded out with it. The source
+    file on disk is left untouched. Refuses to purge a live entry.
+    """
+    with _conn(path) as con:
+        row = con.execute(
+            "SELECT id FROM entries WHERE id=? AND deleted_at IS NOT NULL", (entry_id,)
+        ).fetchone()
+        if not row:
+            return False
+
+        # FTS index rows (search_idx_map is not FK-linked, so clear it by hand)
+        rowids = [
+            r[0] for r in con.execute(
+                "SELECT rowid FROM search_idx_map WHERE entry_id=?", (entry_id,)
+            ).fetchall()
+        ]
+        if rowids:
+            ph = ",".join("?" * len(rowids))
+            con.execute(f"DELETE FROM search_idx WHERE rowid IN ({ph})", rowids)
+            con.execute(f"DELETE FROM search_idx_map WHERE rowid IN ({ph})", rowids)
+
+        # Deals held with this entry — clear inbound superseded_by refs first so
+        # the FK constraint holds, then drop them.
+        doomed = [
+            r[0] for r in con.execute(
+                "SELECT id FROM deals WHERE deleted_with_entry=? AND deleted_at IS NOT NULL",
+                (entry_id,),
+            ).fetchall()
+        ]
+        if doomed:
+            ph = ",".join("?" * len(doomed))
+            con.execute(f"UPDATE deals SET superseded_by=NULL WHERE superseded_by IN ({ph})", doomed)
+            con.execute(f"DELETE FROM deals WHERE id IN ({ph})", doomed)
+        # Any surviving deal that still cites this entry loses its source pointer.
+        con.execute(
+            "UPDATE deals SET source_entry_id=NULL, updated_at=datetime('now')"
+            " WHERE source_entry_id=?",
+            (entry_id,),
+        )
+        # Entities held with this entry (proposed-only by construction)
+        con.execute(
+            "DELETE FROM entities WHERE deleted_with_entry=? AND deleted_at IS NOT NULL",
+            (entry_id,),
+        )
+
+        con.execute("DELETE FROM chunks WHERE entry_id=?", (entry_id,))
+        con.execute("DELETE FROM entry_entities WHERE entry_id=?", (entry_id,))
+        con.execute(
+            "UPDATE entries SET superseded_by=NULL WHERE superseded_by=?", (entry_id,)
+        )
+        con.execute("DELETE FROM entries WHERE id=?", (entry_id,))
+        return True
+
+
+def get_purgeable_entry_ids(retention_days: int, path: Path = DB_PATH) -> list[int]:
+    """IDs of soft-deleted entries whose retention window has elapsed."""
+    with _conn(path) as con:
+        rows = con.execute("""
+            SELECT id FROM entries
+            WHERE deleted_at IS NOT NULL
+              AND julianday('now') - julianday(deleted_at) >= ?
+            ORDER BY deleted_at
+        """, (retention_days,)).fetchall()
+        return [r[0] for r in rows]
+
+
+def purge_expired_deleted(retention_days: int, path: Path = DB_PATH) -> int:
+    """Permanently purge every soft-deleted entry past the retention window."""
+    ids = get_purgeable_entry_ids(retention_days, path)
+    return sum(1 for eid in ids if purge_entry(eid, path))

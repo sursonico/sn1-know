@@ -1,8 +1,9 @@
 """Browse & Filter page — /browse"""
 import pandas as pd
 import streamlit as st
+from config import DELETED_RETENTION_DAYS
 from kb.ui import page_setup, section_title, reliability_badge_html, download_button_for_entry
-from kb.db import get_all_entries
+from kb.db import get_all_entries, get_delete_impact, soft_delete_entry
 
 page_setup("browse", title="Browse — SN1 Knowledge Base")
 
@@ -33,6 +34,60 @@ def load_df() -> pd.DataFrame:
     return df
 
 
+def _reset_delete_state() -> None:
+    """Bump the editor key so every 🗑 checkbox comes back unticked."""
+    st.session_state["browse_editor_nonce"] = st.session_state.get("browse_editor_nonce", 0) + 1
+
+
+@st.dialog("Delete entry")
+def confirm_delete(entry_id: int) -> None:
+    """Name the file, spell out the cascade, and require an explicit confirmation."""
+    impact = get_delete_impact(entry_id)
+    if not impact:
+        st.warning("That entry has already been deleted.")
+        if st.button("Close", key="del_gone"):
+            _reset_delete_state()
+            st.rerun()
+        return
+
+    entry = impact["entry"]
+    label = "note" if entry.get("entry_type") == "snippet" else "document"
+    st.markdown(f"Delete this {label}?")
+    st.markdown(f"### {entry.get('source', '(untitled)')}")
+
+    meta_bits = [b for b in (
+        entry.get("file_type", ""), entry.get("doc_type", ""), entry.get("entry_date", "")
+    ) if b]
+    if meta_bits:
+        st.caption(" · ".join(meta_bits))
+
+    also = [f"{impact['chunks']} indexed page{'s' if impact['chunks'] != 1 else ''}"]
+    if impact["deals"]:
+        also.append(f"{impact['deals']} deal row{'s' if impact['deals'] != 1 else ''} extracted from it")
+    if impact["entities"]:
+        names = ", ".join(e["canonical_name"] for e in impact["entities"])
+        also.append(f"{len(impact['entities'])} proposed entity/entities with no other source ({names})")
+    st.markdown("**Also hidden:** " + "; ".join(also) + ".")
+
+    st.info(
+        f"This is a soft delete — the entry disappears from Browse and is excluded from "
+        f"Ask, but the record and the original file are kept. Restore it from "
+        f"**Admin → Recently Deleted** within {DELETED_RETENTION_DAYS} days.",
+        icon="↩",
+    )
+
+    c_cancel, c_delete = st.columns(2)
+    if c_cancel.button("Cancel", key="del_cancel", use_container_width=True):
+        _reset_delete_state()
+        st.rerun()
+    if c_delete.button("Delete", key="del_confirm", type="primary", use_container_width=True):
+        result = soft_delete_entry(entry_id)
+        _reset_delete_state()
+        load_df.clear()
+        st.session_state["browse_flash"] = (entry.get("source", ""), result)
+        st.rerun()
+
+
 def _tags(df, col):
     seen: set[str] = set()
     for v in df.get(col, pd.Series(dtype=str)):
@@ -44,6 +99,21 @@ def _tags(df, col):
 
 
 section_title("Browse documents & notes")
+
+flash = st.session_state.pop("browse_flash", None)
+if flash:
+    name, result = flash
+    extra = []
+    if result.get("deals"):
+        extra.append(f"{result['deals']} deal row{'s' if result['deals'] != 1 else ''}")
+    if result.get("entities"):
+        extra.append(f"{len(result['entities'])} proposed entity/entities")
+    tail = f" — also hidden: {', '.join(extra)}." if extra else "."
+    st.success(
+        f"Deleted '{name}'{tail} Restore it from Admin → Recently Deleted "
+        f"within {DELETED_RETENTION_DAYS} days."
+    )
+
 df = load_df()
 
 c1, c2, c3, c4, c5, c6 = st.columns([2.2, 1.1, 1.8, 1.4, 1.6, 1.4])
@@ -71,9 +141,18 @@ n_s = int((filtered["entry_type"]=="snippet").sum())  if "entry_type" in filtere
 st.caption(f"Showing {len(filtered)} of {len(df)} entries — {n_d} documents, {n_s} snippets")
 
 cols = ["source","entry_type","reliability","file_type","entry_date","doc_type","sport_tags","org_tags","market_tags","summary","topic_tags"]
-st.dataframe(
-    filtered[[c for c in cols if c in filtered.columns]],
-    use_container_width=True, hide_index=True,
+show_cols = [c for c in cols if c in filtered.columns]
+
+# Tick the 🗑 box on a row to open the confirmation dialog. The editor is read-only
+# apart from that column; the key nonce resets the ticks after delete or cancel.
+table = filtered[show_cols].copy()
+table["🗑"] = False   # trailing column — sits to the right of every data column
+
+edited = st.data_editor(
+    table,
+    use_container_width=True, hide_index=True, num_rows="fixed",
+    disabled=show_cols,
+    key=f"browse_editor_{st.session_state.get('browse_editor_nonce', 0)}",
     column_config={
         "source":      st.column_config.TextColumn("Source",        width="medium"),
         "entry_type":  st.column_config.TextColumn("Type",          width="small"),
@@ -86,8 +165,14 @@ st.dataframe(
         "market_tags": st.column_config.TextColumn("Markets",       width="medium"),
         "summary":     st.column_config.TextColumn("Summary",       width="large"),
         "topic_tags":  st.column_config.TextColumn("Topics",        width="large"),
+        "🗑":           st.column_config.CheckboxColumn("🗑", width="small", help="Delete this entry"),
     },
 )
+st.caption("Tick 🗑 on a row to delete that entry — you'll be asked to confirm first.")
+
+ticked = [i for i in edited.index if bool(edited.at[i, "🗑"])]
+if ticked and "id" in filtered.columns:
+    confirm_delete(int(filtered.at[ticked[0], "id"]))
 
 # ── Download source files ─────────────────────────────────────────────────────
 if "entry_type" in filtered.columns:

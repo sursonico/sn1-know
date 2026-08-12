@@ -34,6 +34,12 @@ STAGE2_BROAD_MAX_CHUNKS    = 160  # max chunks for exhaustive/list questions ("a
 STAGE2_MULTISOURCE_MAX_CHUNKS = 120  # raised budget when a question spans 3+ distinct sources
 CONVERSATION_HISTORY  = 2       # prior turns included in follow-up context
 
+# ── Deletion ────────────────────────────────────────────────────────────────
+# Soft-deleted entries stay recoverable in Admin → Recently Deleted for this many
+# days. Nothing is purged automatically; the Admin page offers a manual purge of
+# entries past this window.
+DELETED_RETENTION_DAYS = int(os.getenv("SN1_DELETED_RETENTION_DAYS", "30"))
+
 # ── Access ────────────────────────────────────────────────────────────────
 SHARE_PASSWORD = os.getenv("SN1_SHARE_PASSWORD", "")
 

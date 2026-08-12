@@ -374,7 +374,7 @@ def retrieve_and_answer(
             "fts_hit_ids": fts_ids, "is_fallback": is_fallback,
         }
 
-    selected_rows = db.get_entries_by_ids(selected_ids, db_path)
+    selected_rows = db.get_entries_by_ids(selected_ids, path=db_path)
 
     # Sort selected rows: FTS-hit entries first (they're the primary sources for this query),
     # then by recency+reliability within each group — ensures primary sources load their pages
