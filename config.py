@@ -23,7 +23,7 @@ ANSWER_MODEL    = os.getenv("SN1_ANSWER_MODEL",     "claude-sonnet-4-6")
 # ── Ingestion ───────────────────────────────────────────────────────────────
 INGEST_BATCH_SIZE  = int(os.getenv("SN1_BATCH_SIZE",  "6"))
 MAX_CHARS_PER_DOC  = int(os.getenv("SN1_MAX_CHARS",   "15000"))
-MAX_CHARS_PER_CHUNK = 3000      # chars stored per page/slide
+MAX_CHARS_PER_CHUNK = int(os.getenv("SN1_MAX_CHARS_PER_CHUNK", "12000"))  # chars stored per page/slide
 OCR_CHAR_THRESHOLD    = 80      # chars/page below which OCR is attempted
 VISION_CHAR_THRESHOLD        = int(os.getenv("SN1_VISION_THRESHOLD",    "50"))   # chars below which vision is attempted
 VISION_IMAGE_COUNT_THRESHOLD = int(os.getenv("SN1_VISION_IMAGE_COUNT", "3"))    # embedded images to trigger hybrid vision
