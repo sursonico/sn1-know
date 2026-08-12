@@ -6,12 +6,17 @@ falls back to the `claude` CLI subprocess (Claude Code OAuth) otherwise.
 """
 
 import json
+import logging
 import os
+import re
 import subprocess
 import textwrap
+from dataclasses import dataclass
 from typing import Optional
 
 from config import CLASSIFY_MODEL, RETRIEVE_MODEL, ANSWER_MODEL
+
+log = logging.getLogger("sn1.llm")
 
 # ── Raw LLM call ─────────────────────────────────────────────────────────────
 
@@ -170,15 +175,72 @@ async def describe_page_images_async(
     return resp.content[0].text.strip()
 
 
-def _parse_json(raw: str, fallback: dict) -> dict:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = "\n".join(raw.split("\n")[1:])
-        raw = raw.rsplit("```", 1)[0].strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {**fallback, "notes": raw[:120]}
+def _strip_fences(raw: str) -> str:
+    """Remove a leading ``` / ```json fence and anything after the closing fence."""
+    s = (raw or "").strip()
+    if not s.startswith("```"):
+        return s
+    s = s.split("\n", 1)[1] if "\n" in s else ""
+    if "```" in s:
+        s = s.rsplit("```", 1)[0]
+    return s.strip()
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    """
+    Return the first balanced {...} block in `text`, ignoring braces inside strings.
+    Lets us recover a JSON object that the model wrapped in prose. Returns None when
+    no complete object is present (e.g. the response was cut off mid-object).
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _loads_dict(raw: str) -> Optional[dict]:
+    """Parse `raw` as a JSON object, tolerating fences and surrounding prose."""
+    stripped = _strip_fences(raw)
+    for candidate in (stripped, _extract_json_object(stripped)):
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _parse_json(raw: str, fallback: dict, where: str = "") -> dict:
+    parsed = _loads_dict(raw)
+    if parsed is not None:
+        return parsed
+    log.warning(
+        "JSON parse failed%s — raw response: %r",
+        f" ({where})" if where else "", (raw or "")[:400],
+    )
+    return {**fallback, "notes": (raw or "")[:120]}
 
 
 # ── Classification ────────────────────────────────────────────────────────────
@@ -370,8 +432,15 @@ _RETRIEVE_SYSTEM = textwrap.dedent("""
     - Prefer CONFIRMED entries over RUMOURED ones when both cover the same topic.
     - Be selective but err toward inclusion for borderline entries.
     - Return [] only if nothing is relevant.
-    Respond with only the JSON object, no markdown fences.
+    - Keep "rationale" under 20 words so the response is never truncated.
+    Respond with only the JSON object, no markdown fences, no prose before or after.
 """).strip()
+
+_STAGE1_RETRY_HINT = (
+    "\n\nIMPORTANT: the previous reply could not be parsed. Respond with ONLY this "
+    'JSON object and nothing else: {"selected_ids": [1, 2, 3], "rationale": "…"}. '
+    "No markdown fences, no explanation outside the JSON, rationale under 20 words."
+)
 
 
 def build_catalogue_context(rows: list[dict]) -> str:
@@ -414,15 +483,76 @@ def build_catalogue_context(rows: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+# Recover IDs from a response whose JSON is malformed or was cut off mid-object.
+_IDS_RE       = re.compile(r'"selected_ids"\s*:\s*\[([0-9,\s]*)', re.I)
+_RATIONALE_RE = re.compile(r'"rationale"\s*:\s*"([^"]*)"', re.I)
+_BARE_ARRAY_RE = re.compile(r'^\s*\[([0-9,\s]*)\]\s*$')
+
+
+def _salvage_selected_ids(raw: str) -> list[int]:
+    """
+    Pull entry IDs out of a Stage 1 response that isn't valid JSON — typically a
+    truncated object (`{"selected_ids": [3, 7, 12`) or a bare array.
+    """
+    s = _strip_fences(raw)
+    m = _IDS_RE.search(s) or _BARE_ARRAY_RE.match(s)
+    if not m:
+        return []
+    return [int(tok) for tok in re.findall(r"\d+", m.group(1))]
+
+
+def _coerce_ids(values, all_ids: set[int]) -> list[int]:
+    """Keep the values that name a real catalogue entry, preserving order, deduped."""
+    out: list[int] = []
+    for v in values or []:
+        try:
+            i = int(v)
+        except (TypeError, ValueError):
+            continue
+        if i in all_ids and i not in out:
+            out.append(i)
+    return out
+
+
+@dataclass
+class Stage1Result:
+    """
+    Outcome of the Stage 1 catalogue scan.
+
+    mode:
+      selected     — the model returned usable IDs
+      salvaged     — JSON was malformed/truncated but IDs were recovered from it
+      empty        — the model validly answered "nothing in the catalogue is relevant"
+      fallback_all — both attempts failed; sweeping FTS hits + the rest of the catalogue
+    `error` is the accumulated diagnostic (empty when everything went cleanly) and
+    `raw` is the last raw model response, so the UI can show what actually came back.
+    """
+    ids: list[int]
+    rationale: str = ""
+    mode: str = "selected"
+    error: str = ""
+    raw: str = ""
+    attempts: int = 1
+
+    @property
+    def is_fallback(self) -> bool:
+        return self.mode == "fallback_all"
+
+
 def select_relevant_entries(
     all_rows: list[dict],
     question: str,
     fts_boost_ids: Optional[list[int]] = None,
-) -> tuple[list[int], str]:
+    max_fallback_entries: int = 25,
+) -> Stage1Result:
     """
     Stage 1: Claude selects relevant entry IDs from the catalogue.
     FTS-boosted IDs are highlighted at the top of the context.
-    Returns (selected_ids, rationale).
+
+    Malformed responses are retried once with a stricter instruction before giving
+    up; if the JSON is merely truncated the IDs are salvaged rather than discarded.
+    Every failure is logged and recorded on the result — a silent fall back to
+    "use everything" hides real breakage.
     """
     # Build context, highlighting FTS hits
     boost_set = set(fts_boost_ids or [])
@@ -437,25 +567,75 @@ def select_relevant_entries(
     parts.append(build_catalogue_context(rest))
     context = "\n\n".join(parts)
 
-    raw = call_claude(
-        _RETRIEVE_SYSTEM,
-        f"Catalogue:\n\n{context}\n\nQuestion: {question}",
-        model=RETRIEVE_MODEL, max_tokens=400, timeout=60,
+    all_ids = {r["id"] for r in all_rows}
+    errors: list[str] = []
+    raw = ""
+
+    for attempt in (1, 2):
+        user = f"Catalogue:\n\n{context}\n\nQuestion: {question}"
+        if attempt == 2:
+            user += _STAGE1_RETRY_HINT
+        try:
+            raw = call_claude(
+                _RETRIEVE_SYSTEM, user,
+                model=RETRIEVE_MODEL,
+                # 400 tokens truncates the JSON when the model lists many IDs or
+                # writes a long rationale — the classic cause of "parse failed".
+                max_tokens=900 if attempt == 2 else 700,
+                timeout=60,
+            )
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            log.warning("Stage 1 LLM call failed (attempt %d): %s", attempt, msg)
+            errors.append(f"attempt {attempt}: LLM call failed — {msg}")
+            continue
+
+        parsed = _loads_dict(raw)
+        if parsed is not None and isinstance(parsed.get("selected_ids"), list):
+            rationale = str(parsed.get("rationale") or "").strip()
+            ids = _coerce_ids(parsed["selected_ids"], all_ids)
+            if ids:
+                return Stage1Result(ids, rationale, "selected", "; ".join(errors), raw, attempt)
+            if not parsed["selected_ids"]:
+                # Valid JSON, deliberately empty — the model found nothing relevant.
+                return Stage1Result([], rationale, "empty", "; ".join(errors), raw, attempt)
+            errors.append(
+                f"attempt {attempt}: returned IDs not in the catalogue "
+                f"({str(parsed['selected_ids'])[:80]})"
+            )
+        else:
+            salvaged = _coerce_ids(_salvage_selected_ids(raw), all_ids)
+            if salvaged:
+                rm = _RATIONALE_RE.search(_strip_fences(raw))
+                log.warning(
+                    "Stage 1 JSON malformed on attempt %d but %d IDs salvaged; raw: %r",
+                    attempt, len(salvaged), raw[:300],
+                )
+                errors.append(
+                    f"attempt {attempt}: response was not valid JSON "
+                    f"(IDs recovered from a truncated/malformed reply)"
+                )
+                return Stage1Result(
+                    salvaged, rm.group(1).strip() if rm else "",
+                    "salvaged", "; ".join(errors), raw, attempt,
+                )
+            log.warning(
+                "Stage 1 returned unparseable response on attempt %d: %r", attempt, raw[:400]
+            )
+            errors.append(
+                f"attempt {attempt}: response was not valid JSON — {raw[:160]!r}"
+            )
+
+    # Both attempts failed — sweep FTS hits first, then the rest of the catalogue.
+    # Stage 2 now ranks pages by relevance across all of them, so a wide net is cheap.
+    fts_first = [i for i in (fts_boost_ids or []) if i in all_ids]
+    others    = [r["id"] for r in all_rows if r["id"] not in set(fts_first)]
+    error     = "; ".join(errors)
+    log.error("Stage 1 failed after 2 attempts, falling back to a catalogue sweep: %s", error)
+    return Stage1Result(
+        (fts_first + others)[:max_fallback_entries],
+        "", "fallback_all", error, raw, 2,
     )
-    result   = _parse_json(raw, {"selected_ids": [], "rationale": ""})
-    selected = result.get("selected_ids", [])
-    rationale = result.get("rationale", "")
-
-    all_ids  = {r["id"] for r in all_rows}
-    if not isinstance(selected, list) or not selected:
-        # Fall back to FTS results only, then all
-        fallback = list(boost_set & all_ids) or list(all_ids)
-        return fallback[:20], "Falling back (could not parse Stage 1 selection)."
-
-    valid = [int(i) for i in selected if int(i) in all_ids]
-    if not valid:
-        return list(boost_set & all_ids) or [], "No valid IDs returned."
-    return valid, rationale
 
 
 # ── Stage 2 answer ────────────────────────────────────────────────────────────

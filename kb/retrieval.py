@@ -8,14 +8,21 @@ Flow:
   4. Claude Stage 2    → generate cited answer (strong Sonnet model)
 """
 
+import logging
+import re
 from pathlib import Path
 from typing import Optional
 
-from config import DB_PATH, STAGE2_MAX_CHUNKS, STAGE2_BROAD_MAX_CHUNKS, STAGE2_MULTISOURCE_MAX_CHUNKS, FTS_CANDIDATE_LIMIT
+from config import (
+    DB_PATH, STAGE2_MAX_CHUNKS, STAGE2_BROAD_MAX_CHUNKS,
+    STAGE2_MULTISOURCE_MAX_CHUNKS, STAGE2_FALLBACK_MAX_CHUNKS, FTS_CANDIDATE_LIMIT,
+)
 from kb import db
 from kb.files import resolve_source_file
 from kb.ingest import extract, full_text as _raw_full_text
 from kb.llm import select_relevant_entries, generate_answer
+
+log = logging.getLogger("sn1.retrieval")
 
 
 # ── Broad / exhaustive question detection ────────────────────────────────────
@@ -146,49 +153,127 @@ _RETRIEVAL_STOP_WORDS = frozenset([
 ])
 
 
+# "2025/26" in a question should also match "2025-26", "2025–26" or "2025/2026"
+# in a deck — season formatting is never consistent across sources.
+_SEASON_RE = re.compile(r"^(\d{4})[/\-–](\d{2}|\d{4})$")
+
+
+def _season_variants(term: str) -> set[str]:
+    m = _SEASON_RE.match(term)
+    if not m:
+        return set()
+    start, end = m.group(1), m.group(2)
+    end2, out = end[-2:], {start}
+    for sep in ("/", "-", "–"):
+        out.add(f"{start}{sep}{end2}")
+        out.add(f"{start}{sep}{start[:2]}{end2}")
+    return out
+
+
 def _question_terms(question: str) -> set[str]:
-    """Return content tokens from the question, lowercased, stop-words removed."""
-    return {
-        t.strip(".,!?;:'\"()[]").lower()
-        for t in question.split()
-        if len(t) > 2 and t.lower() not in _RETRIEVAL_STOP_WORDS
-    }
+    """Content tokens from the question, lowercased, stop-words removed, plus
+    season-format variants so '2025/26' also matches '2025-26' and '2025/2026'."""
+    terms: set[str] = set()
+    for tok in question.split():
+        t = tok.strip(".,!?;:'\"()[]").lower()
+        if len(t) > 2 and t not in _RETRIEVAL_STOP_WORDS:
+            terms.add(t)
+            terms |= _season_variants(t)
+    return terms
 
 
-def _select_chunks_for_question(
-    chunks: list[dict],
-    limit: int,
+def _chunk_score(chunk: dict, terms: set[str]) -> float:
+    """
+    Relevance of one page/slide to the question: how many distinct question terms
+    it contains, with a small density bonus so a page that repeats a term outranks
+    one that mentions it once. 0.0 means no term appears at all.
+    """
+    if not terms:
+        return 0.0
+    text = (chunk.get("text") or "").lower()
+    matched = occurrences = 0
+    for t in terms:
+        c = text.count(t)
+        if c:
+            matched += 1
+            occurrences += min(c, 3)
+    return matched + 0.1 * occurrences if matched else 0.0
+
+
+def _allocate_chunks(
+    selected_rows: list[dict],
+    chunks_by_entry: dict[int, list[dict]],
+    max_chunks: int,
     terms: set[str],
-) -> list[dict]:
+) -> dict[int, list[dict]]:
     """
-    Choose up to `limit` chunks from the list, preferring those most relevant to
-    the question. Strategy:
-      - Always include chunks 0 and 1 (intro/title context), up to the limit.
-      - Fill remaining budget with chunks ranked by keyword-overlap count descending.
-      - Ties broken by original position (earlier first).
-    Returns the selected chunks in their natural order (by chunk_num) so the
-    reader/model sees them in document order, not relevance order.
+    Decide which pages to load, across all sources at once.
+
+    Relevance-first, not document-order: after each source keeps a single anchor
+    page (page 1, so every cited source has identifying context), the whole
+    remaining budget is contested globally by keyword score. A slide 45 that
+    matches the question therefore beats slide 2 of a source that doesn't —
+    which is what makes the wide "catalogue sweep" fallback usable: 20 sources
+    no longer each burn their share on their own front matter.
+
+    Any budget left after the scoring pass is filled round-robin in document
+    order, so no single long deck consumes the remainder.
+
+    Returns {entry_id: [chunk, ...]} with chunks in natural document order.
     """
-    if limit >= len(chunks) or not terms:
-        return chunks[:limit]
+    picked: dict[int, set[int]] = {row["id"]: set() for row in selected_rows}
+    budget = max_chunks
 
-    n_head = min(2, limit)  # always-include head
-    head_set = set(range(n_head))
+    # 1. Anchor page per source (in FTS-priority order, so if the budget is smaller
+    #    than the number of sources the most promising ones are still represented).
+    for row in selected_rows:
+        if budget <= 0:
+            break
+        if chunks_by_entry.get(row["id"]):
+            picked[row["id"]].add(0)
+            budget -= 1
 
-    # Score non-head chunks
-    scored = []
-    for i, chunk in enumerate(chunks):
-        if i in head_set:
-            continue
-        text = (chunk.get("text") or "").lower()
-        score = sum(1 for t in terms if t in text)
-        scored.append((score, i))
+    # 2. Global relevance contest for everything that's left.
+    if budget > 0 and terms:
+        scored: list[tuple[float, int, int, int]] = []
+        for order, row in enumerate(selected_rows):
+            eid = row["id"]
+            for idx, chunk in enumerate(chunks_by_entry.get(eid, [])):
+                if idx in picked[eid]:
+                    continue
+                score = _chunk_score(chunk, terms)
+                if score > 0:
+                    scored.append((score, order, idx, eid))
+        # Highest score first; ties by source priority then page order.
+        scored.sort(key=lambda s: (-s[0], s[1], s[2]))
+        for _score, _order, idx, eid in scored[:budget]:
+            picked[eid].add(idx)
+            budget -= 1
 
-    scored.sort(key=lambda x: (-x[0], x[1]))  # high score first, stable by position
-    picked = head_set | {i for _, i in scored[: limit - n_head]}
+    # 3. Round-robin fill with whatever remains, in document order.
+    if budget > 0:
+        cursors = {row["id"]: 0 for row in selected_rows}
+        progressed = True
+        while budget > 0 and progressed:
+            progressed = False
+            for row in selected_rows:
+                if budget <= 0:
+                    break
+                eid = row["id"]
+                chunks = chunks_by_entry.get(eid, [])
+                i = cursors[eid]
+                while i < len(chunks) and i in picked[eid]:
+                    i += 1
+                if i < len(chunks):
+                    picked[eid].add(i)
+                    cursors[eid] = i + 1
+                    budget -= 1
+                    progressed = True
 
-    # Return in natural document order
-    return [chunks[i] for i in sorted(picked)]
+    return {
+        eid: [chunks_by_entry.get(eid, [])[i] for i in sorted(idxs)]
+        for eid, idxs in picked.items()
+    }
 
 
 def build_source_context(
@@ -204,43 +289,15 @@ def build_source_context(
     truncation_events: [{"cite": str, "entry_id": int, "loaded": int, "total": int}, ...]
     — one entry per source that was partially or entirely omitted.
 
-    Fair-share allocation: each source receives floor(max_chunks / n_sources) chunks in
-    round 1; remaining budget flows to sources with more content (FTS-priority order).
-    Prevents early entries from exhausting the budget and leaving later sources blank.
-
-    Within each source's budget, chunks are selected by keyword relevance to the
-    question (not just pages 1-N), so a relevant slide 45 isn't dropped while
-    slide 1 of another deck is loaded twice.
+    Pages are chosen by relevance to the question across all sources at once (see
+    `_allocate_chunks`), not by document order within a per-source quota, so the one
+    slide that answers the question is loaded even when 20 sources are in play.
     """
     if not selected_rows:
         return "", []
 
-    n = len(selected_rows)
     terms = _question_terms(question) if question else set()
-
-    # ── Fair-share pre-allocation ─────────────────────────────────────────────
-    # Round 1: equal base share (floor division guarantees n*base <= max_chunks).
-    base = max_chunks // n
-    allocs: dict[int, int] = {}
-    used_r1 = 0
-    for row in selected_rows:
-        eid = row["id"]
-        avail = len(chunks_by_entry.get(eid, []))
-        allocs[eid] = min(avail, base)
-        used_r1 += allocs[eid]
-
-    # Round 2: leftover budget flows to sources with more content (list order = FTS-priority).
-    leftover = max_chunks - used_r1
-    if leftover > 0:
-        for row in selected_rows:
-            eid = row["id"]
-            avail = len(chunks_by_entry.get(eid, []))
-            extra = min(avail - allocs[eid], leftover)
-            if extra > 0:
-                allocs[eid] += extra
-                leftover -= extra
-            if leftover <= 0:
-                break
+    allocated = _allocate_chunks(selected_rows, chunks_by_entry, max_chunks, terms)
 
     # ── Build context ──────────────────────────────────────────────────────────
     parts: list[str] = []
@@ -251,9 +308,9 @@ def build_source_context(
         cite = _citation(row)
         entry_chunks = chunks_by_entry.get(eid, [])
         n_total = len(entry_chunks)
-        limit = allocs.get(eid, 0)
+        selected_chunks = allocated.get(eid, [])
 
-        if limit == 0 and n_total > 0:
+        if not selected_chunks and n_total > 0:
             parts.append(
                 f"=== SOURCE NOT LOADED: {cite} ===\n"
                 f"[⚠ Context budget reached — all {n_total} page{'s' if n_total!=1 else ''} "
@@ -265,9 +322,6 @@ def build_source_context(
         meta_line = _source_meta_line(row)
         header = f"=== SOURCE: {cite} ===" + (f"\n{meta_line}" if meta_line else "")
         cite_as = f"CITE AS: [{cite}, <location>]  (replace <location> with e.g. p.4 or slide 3)"
-
-        # Select chunks by relevance within the allocated budget
-        selected_chunks = _select_chunks_for_question(entry_chunks, limit, terms)
 
         chunk_parts: list[str] = []
         for chunk in selected_chunks:
@@ -360,16 +414,20 @@ def retrieve_and_answer(
     fts_ids = db.fts_search(question, limit=FTS_CANDIDATE_LIMIT, path=db_path)
 
     # ── Stage 1b: Claude selects from full catalogue ─────────────────────────
-    selected_ids, rationale = select_relevant_entries(
-        all_entries, question, fts_boost_ids=fts_ids
-    )
-    is_fallback = "Falling back" in rationale or "fall back" in rationale.lower()
+    stage1 = select_relevant_entries(all_entries, question, fts_boost_ids=fts_ids)
+    selected_ids = stage1.ids
+    rationale    = stage1.rationale
+    is_fallback  = stage1.is_fallback
+    if stage1.error:
+        log.warning("Stage 1 problem (mode=%s): %s", stage1.mode, stage1.error)
 
     if not selected_ids:
         return {
             "answer": "The knowledge base does not contain sufficient information to answer this question.",
             "selected": [], "rationale": rationale,
             "fts_hit_ids": fts_ids, "is_fallback": is_fallback,
+            "stage1_mode": stage1.mode, "stage1_error": stage1.error,
+            "stage1_raw": stage1.raw, "stage1_attempts": stage1.attempts,
         }
 
     selected_rows = db.get_entries_by_ids(selected_ids, path=db_path)
@@ -383,15 +441,18 @@ def retrieve_and_answer(
     )
 
     # ── Adaptive chunk budget ────────────────────────────────────────────────
-    # Raise budget for exhaustive questions ("all markets", "every deal") and for
-    # multi-source questions (3+ sources selected) so fair-share allocation has
-    # enough room to give each source adequate coverage.
+    # Raise the budget for exhaustive questions ("all markets", "every deal"), for
+    # multi-source questions (3+ sources), and most of all when Stage 1 failed and
+    # we're sweeping the whole catalogue — that sweep only works if there is room
+    # for the relevance ranking to pull in the pages that actually match.
     is_broad = _is_broad_question(question)
     chunk_budget = STAGE2_MAX_CHUNKS
     if is_broad:
         chunk_budget = max(chunk_budget, STAGE2_BROAD_MAX_CHUNKS)
     if len(selected_rows) >= 3:
         chunk_budget = max(chunk_budget, STAGE2_MULTISOURCE_MAX_CHUNKS)
+    if is_fallback:
+        chunk_budget = max(chunk_budget, STAGE2_FALLBACK_MAX_CHUNKS)
 
     # ── Load chunks ──────────────────────────────────────────────────────────
     chunks_by_entry = db.get_chunks_for_entries(selected_ids, db_path)
@@ -445,4 +506,8 @@ def retrieve_and_answer(
         "fts_hit_ids":       fts_ids,
         "is_fallback":       is_fallback,
         "truncated_sources": truncations,
+        "stage1_mode":       stage1.mode,
+        "stage1_error":      stage1.error,
+        "stage1_raw":        stage1.raw,
+        "stage1_attempts":   stage1.attempts,
     }

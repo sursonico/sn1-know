@@ -52,14 +52,48 @@ if (ask_btn or _autorun) and question.strip():
     fts_ids     = result["fts_hit_ids"]
     is_fb       = result["is_fallback"]
     truncations = result.get("truncated_sources", [])
+    s1_mode     = result.get("stage1_mode", "")
+    s1_error    = result.get("stage1_error", "")
+    s1_raw      = result.get("stage1_raw", "")
     entries     = get_all_entries()
+
+    def _stage1_diagnostics() -> None:
+        """Show what actually went wrong in Stage 1 rather than hiding it."""
+        with st.expander("⚙ Stage 1 diagnostics — what went wrong", expanded=False):
+            st.markdown(f"**Outcome:** `{s1_mode}` after {result.get('stage1_attempts', 1)} attempt(s)")
+            if s1_error:
+                st.markdown("**Error:**")
+                st.code(s1_error, language="text")
+            if s1_raw:
+                st.markdown("**Raw Stage 1 response:**")
+                st.code(s1_raw[:2000] or "(empty)", language="text")
+            st.caption(
+                "Stage 1 asks Claude to pick relevant entries from the catalogue as JSON. "
+                "A malformed reply is retried once, then IDs are salvaged if possible; "
+                "only if that fails does the app sweep the whole catalogue. "
+                "The same detail is written to the server log."
+            )
 
     if not selected:
         st.info(answer)
+        if s1_error:
+            st.warning("Stage 1 did not return a usable selection — details below.")
+            _stage1_diagnostics()
     else:
         if is_fb:
-            st.warning(f"Using all {len(selected)} entries (Stage 1 parse failed).")
+            st.warning(
+                f"Stage 1 catalogue scan failed — sweeping {len(selected)} entries and "
+                "ranking pages by relevance instead. The answer may still be correct; "
+                "expand the diagnostics to see the underlying error."
+            )
+            _stage1_diagnostics()
         else:
+            if s1_error:
+                st.info(
+                    f"Stage 1 recovered from a malformed response (`{s1_mode}`) — "
+                    "selection below is still usable."
+                )
+                _stage1_diagnostics()
             icons = {"document": "📄", "snippet": "📝"}
             lines = [f"- {icons.get(s['entry_type'],'📌')} `{s['cite']}`" for s in selected]
             st.success(

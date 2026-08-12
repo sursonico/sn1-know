@@ -35,6 +35,7 @@ FTS_CANDIDATE_LIMIT   = 30      # max entries returned from FTS keyword pass
 STAGE2_MAX_CHUNKS          = 80   # max chunks sent to final-answer model (default)
 STAGE2_BROAD_MAX_CHUNKS    = 160  # max chunks for exhaustive/list questions ("all markets", "every deal")
 STAGE2_MULTISOURCE_MAX_CHUNKS = 120  # raised budget when a question spans 3+ distinct sources
+STAGE2_FALLBACK_MAX_CHUNKS = 200  # Stage 1 failed → wide catalogue sweep needs room to find the answer
 CONVERSATION_HISTORY  = 2       # prior turns included in follow-up context
 
 # ── Deletion ────────────────────────────────────────────────────────────────
