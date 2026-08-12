@@ -16,13 +16,14 @@ migrate_entities.py — link existing entries to entities
 seed_entities.py    — canonical entity seed list
 kb/
   db.py             — database layer: schema, CRUD, FTS5, entity CRUD
+  files.py          — source-file resolution: SN1_DOCS_DIR + stored relative path
   ingest.py         — ingestion pipeline: extract → hash → classify → store → resolve entities
   llm.py            — LLM client: classify, enrich, entity resolution, answer, overview
   retrieval.py      — hybrid retrieval: FTS5 + Claude Stage 1 → Stage 2 cited answer
   ui.py             — shared Streamlit utilities: styles, nav, components
 pages/
-  entity.py         — entity hub (overview, linked entries, scoped Ask)
-  browse.py         — browse & filter table + per-row soft delete
+  entity.py         — entity hub (overview, deals, broadcaster coverage, sources)
+  browse.py         — browse & filter table + per-row open file / soft delete
   ask.py            — global Ask (FTS + two-stage retrieval)
   add_log.py        — Add Documents + Log Snippet
   admin.py          — entity rename, merge, alias editing, recycle bin
@@ -102,7 +103,11 @@ the seed list. The Admin page shows a review queue for these.
 - All LLM calls via `kb/llm.py` (SDK if `ANTHROPIC_API_KEY`, else `claude` CLI).
 - `config.py` owns all constants — import with `from config import X`.
 - Every page starts with `from kb.ui import page_setup; page_setup("nav_key")`.
-- `file_path` always stores the **absolute** path.
+- `file_path` stores the path **relative to `DOCS_DIR`** (absolute only for files
+  outside it). Never `Path(entry["file_path"])` directly — call
+  `kb.files.resolve_source_file(entry)`, which handles relative paths, legacy
+  absolute paths from another machine, and filename-only lookup, returning `None`
+  when the file genuinely isn't there.
 - Content hash (SHA-256) prevents re-processing unchanged files.
 
 ## SN1 brand

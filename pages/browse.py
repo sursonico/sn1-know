@@ -2,7 +2,10 @@
 import pandas as pd
 import streamlit as st
 from config import DELETED_RETENTION_DAYS
-from kb.ui import page_setup, section_title, reliability_badge_html, download_button_for_entry
+from kb.ui import (
+    page_setup, section_title, reliability_badge_html, download_button_for_entry,
+    open_file_dialog,
+)
 from kb.db import get_all_entries, get_delete_impact, soft_delete_entry
 
 page_setup("browse", title="Browse — SN1 Knowledge Base")
@@ -34,8 +37,8 @@ def load_df() -> pd.DataFrame:
     return df
 
 
-def _reset_delete_state() -> None:
-    """Bump the editor key so every 🗑 checkbox comes back unticked."""
+def _reset_row_actions() -> None:
+    """Bump the editor key so the 📄 / 🗑 checkboxes all come back unticked."""
     st.session_state["browse_editor_nonce"] = st.session_state.get("browse_editor_nonce", 0) + 1
 
 
@@ -46,7 +49,7 @@ def confirm_delete(entry_id: int) -> None:
     if not impact:
         st.warning("That entry has already been deleted.")
         if st.button("Close", key="del_gone"):
-            _reset_delete_state()
+            _reset_row_actions()
             st.rerun()
         return
 
@@ -78,11 +81,11 @@ def confirm_delete(entry_id: int) -> None:
 
     c_cancel, c_delete = st.columns(2)
     if c_cancel.button("Cancel", key="del_cancel", use_container_width=True):
-        _reset_delete_state()
+        _reset_row_actions()
         st.rerun()
     if c_delete.button("Delete", key="del_confirm", type="primary", use_container_width=True):
         result = soft_delete_entry(entry_id)
-        _reset_delete_state()
+        _reset_row_actions()
         load_df.clear()
         st.session_state["browse_flash"] = (entry.get("source", ""), result)
         st.rerun()
@@ -143,10 +146,11 @@ st.caption(f"Showing {len(filtered)} of {len(df)} entries — {n_d} documents, {
 cols = ["source","entry_type","reliability","file_type","entry_date","doc_type","sport_tags","org_tags","market_tags","summary","topic_tags"]
 show_cols = [c for c in cols if c in filtered.columns]
 
-# Tick the 🗑 box on a row to open the confirmation dialog. The editor is read-only
-# apart from that column; the key nonce resets the ticks after delete or cancel.
+# Tick 📄 to view the original file, 🗑 to delete. The editor is read-only apart
+# from those two columns; the key nonce resets the ticks after any action.
 table = filtered[show_cols].copy()
-table["🗑"] = False   # trailing column — sits to the right of every data column
+table["📄"] = False   # trailing columns — to the right of every data column
+table["🗑"] = False
 
 edited = st.data_editor(
     table,
@@ -165,14 +169,26 @@ edited = st.data_editor(
         "market_tags": st.column_config.TextColumn("Markets",       width="medium"),
         "summary":     st.column_config.TextColumn("Summary",       width="large"),
         "topic_tags":  st.column_config.TextColumn("Topics",        width="large"),
+        "📄":           st.column_config.CheckboxColumn("📄", width="small", help="Open the original file"),
         "🗑":           st.column_config.CheckboxColumn("🗑", width="small", help="Delete this entry"),
     },
 )
-st.caption("Tick 🗑 on a row to delete that entry — you'll be asked to confirm first.")
+st.caption(
+    "Tick 📄 on a row to view or download the original file, or 🗑 to delete that "
+    "entry — deletions ask for confirmation first."
+)
 
-ticked = [i for i in edited.index if bool(edited.at[i, "🗑"])]
-if ticked and "id" in filtered.columns:
-    confirm_delete(int(filtered.at[ticked[0], "id"]))
+if "id" in filtered.columns:
+    opened = [i for i in edited.index if bool(edited.at[i, "📄"])]
+    ticked = [i for i in edited.index if bool(edited.at[i, "🗑"])]
+    if ticked:
+        confirm_delete(int(filtered.at[ticked[0], "id"]))
+    elif opened:
+        row = dict(filtered.loc[opened[0]])
+        if row.get("entry_type") == "document":
+            open_file_dialog(row, on_close=_reset_row_actions)
+        else:
+            st.info("Logged notes have no source file — their full text is on the Ask page.")
 
 # ── Download source files ─────────────────────────────────────────────────────
 if "entry_type" in filtered.columns:

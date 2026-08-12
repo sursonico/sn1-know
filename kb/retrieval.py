@@ -13,6 +13,7 @@ from typing import Optional
 
 from config import DB_PATH, STAGE2_MAX_CHUNKS, STAGE2_BROAD_MAX_CHUNKS, STAGE2_MULTISOURCE_MAX_CHUNKS, FTS_CANDIDATE_LIMIT
 from kb import db
+from kb.files import resolve_source_file
 from kb.ingest import extract, full_text as _raw_full_text
 from kb.llm import select_relevant_entries, generate_answer
 
@@ -299,11 +300,8 @@ def _load_doc_chunks_from_file(row: dict) -> list[db.Chunk]:
     For a document entry that has no chunks in the DB, fall back to reading
     the source file and extracting on-the-fly.
     """
-    file_path = row.get("file_path", "")
-    if not file_path:
-        return []
-    path = Path(file_path)
-    if not path.exists():
+    path = resolve_source_file(row)
+    if path is None:
         return []
     result = extract(path)
     if result.error:

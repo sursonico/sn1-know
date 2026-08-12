@@ -26,6 +26,7 @@ from config import (
     VISION_CHAR_THRESHOLD, VISION_IMAGE_COUNT_THRESHOLD, VISION_HYBRID_MAX_CHARS,
 )
 from kb import db
+from kb.files import store_path, clear_lookup_cache
 from kb.llm import (
     classify_document_async, resolve_entities_async, extract_deals_async,
     vision_sdk_available, describe_page_images_async,
@@ -436,7 +437,7 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
     if result.error:
         entry_id = db.upsert_document(
             source=source, file_type=result.file_type,
-            ingest_error=result.error, file_path=str(path.resolve()),
+            ingest_error=result.error, file_path=store_path(path),
             content_hash=h,
         )
         log.warning("Extraction error for %s: %s", source, result.error)
@@ -450,7 +451,7 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
         entry_id = db.upsert_document(
             source=source, file_type=result.file_type,
             ingest_error="No text extracted",
-            file_path=str(path.resolve()), content_hash=h,
+            file_path=store_path(path), content_hash=h,
         )
         return f"EMPTY {source}"
 
@@ -482,7 +483,7 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
         topic_tags      = meta.get("topics", ""),
         summary         = meta.get("summary", ""),
         notes           = meta.get("notes", ""),
-        file_path       = str(path.resolve()),
+        file_path       = store_path(path),
         content_hash    = h,
         is_duplicate    = is_dup,
         ocr_used        = int(result.ocr_used),
@@ -579,7 +580,9 @@ async def ingest_all_async(
                 return f"FAIL  {p.name}: {e}"
 
     tasks = [run_one(p) for p in paths]
-    return await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks)
+    clear_lookup_cache()   # new files on disk — drop any cached "not found" lookups
+    return results
 
 
 def ingest_directory(docs_dir: Path = DOCS_DIR) -> list[str]:

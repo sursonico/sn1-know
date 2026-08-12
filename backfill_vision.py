@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from kb import db
+from kb.files import resolve_source_file
 from kb.llm import vision_sdk_available, extract_deals
 from kb.ingest import (
     Chunk, ExtractionResult, extract,
@@ -42,14 +43,13 @@ async def backfill_entry(
     """Returns number of chunks updated."""
     eid    = entry["id"]
     source = entry["source"]
-    fpath  = entry.get("file_path", "")
     ftype  = (entry.get("file_type") or "").lower()
 
-    if not fpath or not Path(fpath).exists():
+    path = resolve_source_file(entry)
+    if path is None:
         print(f"  #{eid} [{ftype}] {source[:60]} — file not found, skipping")
         return 0
 
-    path = Path(fpath)
     if path.suffix.lower() not in (".pdf", ".pptx"):
         return 0
 

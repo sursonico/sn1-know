@@ -16,6 +16,7 @@ from kb.llm import (
     enrich_snippet, enrich_url_article, enrich_document,
     resolve_entities, check_new_entry_conflicts, extract_deals,
 )
+from kb.files import resolve_source_file
 from kb.ingest import ingest_all_async, extract as extract_file, full_text as _ft
 from kb.web import fetch_article, error_message
 from config import DOCS_DIR
@@ -48,7 +49,12 @@ with tab_add:
             + ". Review extracted intelligence below — edit anything that needs correcting, then click Done."
         )
 
-        all_e = {e["file_path"]: e for e in get_all_entries() if e.get("file_path")}
+        # Keyed on filename: uploads land in DOCS_DIR under their own name, and
+        # `source` is that filename (file_path is stored relative to DOCS_DIR).
+        all_e = {
+            e["source"]: e for e in get_all_entries()
+            if e.get("entry_type") == "document"
+        }
 
         for path_str, result in zip(dr["paths"], dr["statuses"]):
             fname = Path(path_str).name
@@ -60,7 +66,7 @@ with tab_add:
                 st.error(f"**✗  {fname}** — {result}")
                 continue
 
-            entry = all_e.get(path_str)
+            entry = all_e.get(fname)
             if not entry:
                 st.warning(f"📄 **{fname}** — processed but entry not found in database")
                 continue
@@ -237,8 +243,11 @@ with tab_add:
                         prog.progress(i/n, text=f"Enriching {entry['source']}…")
                         with st.status(f"**{entry['source']}**", expanded=False) as s:
                             try:
-                                path = Path(entry.get("file_path") or DOCS_DIR/entry["source"])
-                                if not path.exists(): raise FileNotFoundError(str(path))
+                                path = resolve_source_file(entry)
+                                if path is None:
+                                    raise FileNotFoundError(
+                                        f"{entry['source']} not found under {DOCS_DIR}"
+                                    )
                                 result = extract_file(path)
                                 meta   = enrich_document(entry["source"], _ft(result))
                                 update_enrichment(entry["id"], summary=meta.get("summary",""), topic_tags=meta.get("topics",""))

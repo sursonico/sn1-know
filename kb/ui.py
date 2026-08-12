@@ -8,11 +8,13 @@ This handles set_page_config, CSS injection, and the branded header + nav.
 import base64
 import hashlib
 from pathlib import Path
+from typing import Callable, Optional
 
 import streamlit as st
 
-from config import LOGO_PATH, DB_PATH, SHARE_PASSWORD
+from config import LOGO_PATH, DB_PATH, DOCS_DIR, SHARE_PASSWORD
 from kb import db
+from kb.files import resolve_source_file
 
 # ── Type metadata ─────────────────────────────────────────────────────────────
 
@@ -454,17 +456,32 @@ _DOWNLOAD_MIME: dict[str, str] = {
 }
 
 
+def _fmt_size(n_bytes: int) -> str:
+    if n_bytes < 1024:
+        return f"{n_bytes} B"
+    if n_bytes < 1024 * 1024:
+        return f"{n_bytes / 1024:.0f} KB"
+    return f"{n_bytes / (1024 * 1024):.1f} MB"
+
+
+def _missing_file_message(entry: dict) -> str:
+    """Explain where we looked when a source file can't be found."""
+    stored = (entry.get("file_path") or "").strip()
+    where = f" (looked for `{stored}`)" if stored else ""
+    return (
+        f"Original file not found under the documents folder `{DOCS_DIR}`{where}. "
+        "Set `SN1_DOCS_DIR` to the folder holding the source files, or re-upload the "
+        "document on the Add & Log page."
+    )
+
+
 def download_button_for_entry(entry: dict, key_suffix: str = "") -> None:
     """
-    Render a download button for a document entry's source file.
-    Falls back to a muted notice if the file is missing — never errors.
+    Render a download button for a document entry's source file, resolved against
+    SN1_DOCS_DIR. Falls back to a muted notice if the file is missing — never errors.
     """
-    fp = (entry.get("file_path") or "").strip()
-    if not fp:
-        st.caption("Source file not available.")
-        return
-    p = Path(fp)
-    if not p.exists():
+    p = resolve_source_file(entry)
+    if p is None:
         st.caption("Source file not available on this machine.")
         return
     try:
@@ -482,3 +499,84 @@ def download_button_for_entry(entry: dict, key_suffix: str = "") -> None:
         mime=mime,
         key=f"dl_{entry.get('id', 'x')}_{key_suffix}",
     )
+
+
+@st.dialog("Original document")
+def open_file_dialog(entry: dict, on_close: Optional[Callable[[], None]] = None) -> None:
+    """
+    Show the source file for a document entry and offer it for download.
+    The bytes are only read here, so listing hundreds of rows stays cheap.
+
+    `on_close` renders a Close button wired to the caller's dismiss logic — used by
+    Browse, where the dialog is driven by a checkbox that has to be unticked.
+    """
+    source = entry.get("source") or "(untitled)"
+    st.markdown(f"### {source}")
+
+    meta_bits = [b for b in (
+        entry.get("file_type", ""), entry.get("doc_type", ""), entry.get("entry_date", "")
+    ) if b]
+    if meta_bits:
+        st.caption(" · ".join(meta_bits))
+
+    _render_file_body(entry)
+
+    if on_close is not None and st.button("Close", key=f"open_close_{entry.get('id', 'x')}"):
+        on_close()
+        st.rerun()
+
+
+def _render_file_body(entry: dict) -> None:
+    """Resolve, describe and offer the entry's file — or explain why it's missing."""
+    path = resolve_source_file(entry)
+    if path is None:
+        st.warning(_missing_file_message(entry), icon="📄")
+        return
+
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        st.error(f"The file was found at `{path}` but could not be read: {e}")
+        return
+
+    try:
+        location = path.resolve().relative_to(Path(DOCS_DIR).resolve())
+    except ValueError:
+        location = path
+    st.caption(f"{_fmt_size(len(data))} · {location}")
+
+    ext   = path.suffix.lower()
+    mime  = _DOWNLOAD_MIME.get(ext, "application/octet-stream")
+    label = ext.upper().lstrip(".") if ext else "FILE"
+    st.download_button(
+        label=f"⬇ Open / download {label}",
+        data=data,
+        file_name=path.name,
+        mime=mime,
+        type="primary",
+        key=f"open_dl_{entry.get('id', 'x')}",
+    )
+    st.caption(
+        "Opens in your browser's default handler, or saves to your downloads folder."
+    )
+
+    if entry.get("summary"):
+        st.markdown("**Summary**")
+        st.write(entry["summary"])
+
+
+def open_file_button(
+    entry: dict,
+    key_suffix: str = "",
+    label: str = "📄 Open",
+    use_container_width: bool = False,
+) -> None:
+    """Button that opens the source-file dialog for a document entry."""
+    if st.button(
+        label,
+        key=f"openbtn_{entry.get('id', 'x')}_{key_suffix}",
+        type="secondary",
+        use_container_width=use_container_width,
+        help=f"View or download the original file for {entry.get('source', 'this document')}",
+    ):
+        open_file_dialog(entry)

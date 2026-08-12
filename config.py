@@ -7,6 +7,9 @@ from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 ROOT_DIR  = Path(__file__).parent
+# Root folder for original source files. Entries store `file_path` relative to it,
+# so the same database resolves locally (./sample_docs) and on Render (persistent
+# disk) just by pointing SN1_DOCS_DIR at the right folder. See kb/files.py.
 DOCS_DIR  = Path(os.getenv("SN1_DOCS_DIR", str(ROOT_DIR / "sample_docs")))
 DB_PATH   = Path(os.getenv("SN1_DB_PATH", str(ROOT_DIR / "knowledge_base.db")))
 LOGO_PATH = ROOT_DIR / "sn1-logo.png"

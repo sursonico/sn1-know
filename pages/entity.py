@@ -7,7 +7,7 @@ import streamlit as st
 
 from kb.ui import (
     page_setup, entity_type_badge, section_title,
-    reliability_badge_html,
+    reliability_badge_html, open_file_button,
 )
 from kb import db
 from kb.llm import generate_entity_overview
@@ -527,5 +527,32 @@ if deals_base:
             '</p>'
             '</div>',
             unsafe_allow_html=True,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — Source documents
+# ═══════════════════════════════════════════════════════════════════════════════
+section_title("Sources")
+
+if not entries:
+    st.caption("No documents or notes are linked to this entity yet.")
+else:
+    for _doc in sorted(docs, key=lambda e: (e.get("entry_date") or "", e["source"]), reverse=True):
+        _meta = [b for b in (
+            _doc.get("file_type", ""), _doc.get("doc_type", ""), _doc.get("entry_date", "")
+        ) if b]
+        _c_label, _c_btn = st.columns([5, 1])
+        _c_label.markdown(f"📄 **{_doc['source']}**")
+        if _meta:
+            _c_label.caption("  ·  ".join(_meta))
+        with _c_btn:
+            open_file_button(_doc, key_suffix=f"ent_{entity_id}", use_container_width=True)
+
+    if snips:
+        st.caption(
+            f"Plus {len(snips)} logged note{'s' if len(snips) != 1 else ''}: "
+            + ", ".join(f"{s['source']} ({s.get('entry_date', '?')})" for s in snips[:8])
+            + ("…" if len(snips) > 8 else "")
         )
 
