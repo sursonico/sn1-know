@@ -310,18 +310,34 @@ def _count_pptx_pictures(shapes) -> int:
     return count
 
 
+def _collect_pptx_shape_text(shapes) -> list[str]:
+    """Recursively collect paragraph text from shapes, descending into groups.
+
+    Many decks lay out slide body content (stat callouts, bullet lists) inside
+    grouped shapes rather than directly on the slide — a flat top-level scan
+    only picks up the slide title and leaves everything else unextracted.
+    """
+    texts: list[str] = []
+    for shape in shapes:
+        if shape.shape_type == 6:  # MSO_SHAPE_TYPE.GROUP
+            try:
+                texts.extend(_collect_pptx_shape_text(shape.shapes))
+            except Exception:
+                pass
+        elif shape.has_text_frame:
+            for para in shape.text_frame.paragraphs:
+                line = " ".join(r.text for r in para.runs).strip()
+                if line:
+                    texts.append(line)
+    return texts
+
+
 def _extract_pptx(path: Path) -> ExtractionResult:
     chunks: list[Chunk] = []
     try:
         prs = Presentation(path)
         for i, slide in enumerate(prs.slides, start=1):
-            texts = []
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for para in shape.text_frame.paragraphs:
-                        line = " ".join(r.text for r in para.runs).strip()
-                        if line:
-                            texts.append(line)
+            texts = _collect_pptx_shape_text(slide.shapes)
             n_images = _count_pptx_pictures(slide.shapes)
             chunks.append(Chunk(i, "slide", "\n".join(texts)[:MAX_CHARS_PER_CHUNK], image_count=n_images))
     except Exception as e:
@@ -370,8 +386,19 @@ def extract(path: Path) -> ExtractionResult:
 
 
 def full_text(result: ExtractionResult) -> str:
-    """Concatenate all chunk text, truncated to MAX_CHARS_PER_DOC."""
-    return "\n\n".join(c.text for c in result.chunks if c.text.strip())[:MAX_CHARS_PER_DOC]
+    """
+    Concatenate chunk text for document-level classification, capped at
+    MAX_CHARS_PER_DOC. Each chunk gets a fair per-chunk share of the budget
+    before joining, so a many-page/slide document doesn't have its back half
+    squeezed out entirely by front matter that alone fills the whole cap —
+    every page still contributes something to classification and entity/deal
+    extraction.
+    """
+    texts = [c.text for c in result.chunks if c.text.strip()]
+    if not texts:
+        return ""
+    per_chunk = max(MAX_CHARS_PER_DOC // len(texts), 200)
+    return "\n\n".join(t[:per_chunk] for t in texts)[:MAX_CHARS_PER_DOC]
 
 
 # ── Content hashing ───────────────────────────────────────────────────────────
