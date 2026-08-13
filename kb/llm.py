@@ -923,48 +923,81 @@ _ENTITY_SYSTEM = textwrap.dedent("""
 """).strip()
 
 
-def resolve_entities(metadata: dict) -> list[dict]:
+_ENTITY_MAX_ATTEMPTS = 3  # this call is markedly flaky over the claude-CLI fallback — see resolve_entities_async docstring
+
+
+def _entity_metadata_text(metadata: dict) -> str:
+    return " | ".join(filter(None, [
+        metadata.get("sports_leagues", ""),
+        metadata.get("org_tags", ""),
+        metadata.get("market_tags", ""),
+        metadata.get("topic_tags", ""),
+    ]))
+
+
+def _parse_entity_list(raw: str) -> Optional[list[dict]]:
+    """Returns the parsed list, or None if raw isn't a parseable JSON array."""
+    try:
+        result = json.loads(_strip_fences(raw))
+    except json.JSONDecodeError:
+        return None
+    return result if isinstance(result, list) else None
+
+
+def resolve_entities(metadata: dict, max_attempts: int = _ENTITY_MAX_ATTEMPTS) -> list[dict]:
     """
     Given classification metadata dict, return resolved entity list.
     Each item: {"canonical": str, "type": str, "is_new": bool}
+
+    Retries up to max_attempts times on a failed call or an unparseable response —
+    this call runs over the same claude-CLI subprocess fallback used everywhere else
+    without an API key, which we've observed intermittently timing out or returning
+    conversational commentary instead of the requested JSON array. Without a retry,
+    one bad response silently produces zero entity links for the document even
+    though the tags it was given (from a separate, successful classification call)
+    clearly named the entities — see kb/ingest.py's validation-warning banner, which
+    is what surfaces exactly this failure mode.
     """
-    text = " | ".join(filter(None, [
-        metadata.get("sports_leagues", ""),
-        metadata.get("org_tags", ""),
-        metadata.get("market_tags", ""),
-        metadata.get("topic_tags", ""),
-    ]))
+    text = _entity_metadata_text(metadata)
     if not text.strip():
         return []
-    raw = call_claude(_ENTITY_SYSTEM, f"Metadata: {text}", model=CLASSIFY_MODEL, max_tokens=600)
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = "\n".join(raw.split("\n")[1:]).rsplit("```", 1)[0].strip()
-    try:
-        result = json.loads(raw)
-        return result if isinstance(result, list) else []
-    except json.JSONDecodeError:
-        return []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            raw = call_claude(_ENTITY_SYSTEM, f"Metadata: {text}", model=CLASSIFY_MODEL, max_tokens=600)
+        except Exception as e:
+            log.warning("resolve_entities: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
+            continue
+        result = _parse_entity_list(raw)
+        if result is not None:
+            return result
+        log.warning(
+            "resolve_entities: JSON parse failed (attempt %d/%d) — raw response: %r",
+            attempt, max_attempts, raw[:300],
+        )
+    log.warning("resolve_entities: all %d attempts failed — returning no entities", max_attempts)
+    return []
 
 
-async def resolve_entities_async(metadata: dict) -> list[dict]:
-    text = " | ".join(filter(None, [
-        metadata.get("sports_leagues", ""),
-        metadata.get("org_tags", ""),
-        metadata.get("market_tags", ""),
-        metadata.get("topic_tags", ""),
-    ]))
+async def resolve_entities_async(metadata: dict, max_attempts: int = _ENTITY_MAX_ATTEMPTS) -> list[dict]:
+    """Async counterpart of resolve_entities() — see its docstring for the retry rationale."""
+    text = _entity_metadata_text(metadata)
     if not text.strip():
         return []
-    raw = await call_claude_async(_ENTITY_SYSTEM, f"Metadata: {text}", model=CLASSIFY_MODEL, max_tokens=600)
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = "\n".join(raw.split("\n")[1:]).rsplit("```", 1)[0].strip()
-    try:
-        result = json.loads(raw)
-        return result if isinstance(result, list) else []
-    except json.JSONDecodeError:
-        return []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            raw = await call_claude_async(_ENTITY_SYSTEM, f"Metadata: {text}", model=CLASSIFY_MODEL, max_tokens=600)
+        except Exception as e:
+            log.warning("resolve_entities_async: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
+            continue
+        result = _parse_entity_list(raw)
+        if result is not None:
+            return result
+        log.warning(
+            "resolve_entities_async: JSON parse failed (attempt %d/%d) — raw response: %r",
+            attempt, max_attempts, raw[:300],
+        )
+    log.warning("resolve_entities_async: all %d attempts failed — returning no entities", max_attempts)
+    return []
 
 
 # ── Entity overview (AI "what we know" summary) ───────────────────────────────
