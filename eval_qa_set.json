@@ -1,0 +1,128 @@
+[
+  {
+    "id": "premier-league-value",
+    "question": "What is the Premier League's current annual media-rights value?",
+    "expected_answer": "~$5.11bn (€4.4bn) per season, annualised for 2025/26–2027/28.",
+    "expected_keywords": ["5.11bn"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — English Premier League slide"
+  },
+  {
+    "id": "fifa-world-cup-2026-revenue",
+    "question": "How much media-rights revenue is FIFA on course to generate from the 2026 World Cup?",
+    "expected_answer": "At least $4.3bn (€3.7bn), >45% above 2022.",
+    "expected_keywords": ["4.3bn"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — FIFA World Cup slide"
+  },
+  {
+    "id": "fifa-world-cup-2026-teams",
+    "question": "How many teams will compete in the 2026 FIFA World Cup, and how many matches will be played?",
+    "expected_answer": "Expands from 32 to 48 teams; matches increase from 64 to 104.",
+    "expected_keywords": ["48 teams", "104"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — FIFA World Cup slide"
+  },
+  {
+    "id": "laliga-attendance-record",
+    "question": "What attendance record did LaLiga set in the 2025/26 season?",
+    "expected_answer": "A new attendance record, surpassing 17.5 million spectators, up 0.8% year-over-year.",
+    "expected_keywords": ["17.5 million"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — LaLiga slide"
+  },
+  {
+    "id": "laliga-intl-rights-value",
+    "question": "What was LaLiga's 2024/25 international media rights value?",
+    "expected_answer": "€765m, growing ~€20m/yr since 2020/21.",
+    "expected_keywords": ["765m"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — LaLiga slide"
+  },
+  {
+    "id": "serie-a-intl-rights-value",
+    "question": "What is Serie A's 2024/25 international media rights value?",
+    "expected_answer": "€242.6m, managed in-house from 2024/25.",
+    "expected_keywords": ["242.6"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — Serie A slide"
+  },
+  {
+    "id": "ligue1-cvc-stake",
+    "question": "How much did CVC Capital Partners invest in Ligue 1's commercial revenues, and for what stake?",
+    "expected_answer": "€1.5bn for a 13% stake, via the LFP Media joint venture.",
+    "expected_keywords": ["1.5bn", "13%"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — Ligue 1 slide"
+  },
+  {
+    "id": "nba-media-betting-rights",
+    "question": "How much are current NBA media and betting rights worth annually?",
+    "expected_answer": "Approximately $7.6bn (€6.6bn) annually, >90% from new US national agreements.",
+    "expected_keywords": ["7.6bn"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — NBA slide"
+  },
+  {
+    "id": "euroleague-team-count",
+    "question": "How many teams does EuroLeague have in the 2025/26 season, and how many did it have before?",
+    "expected_answer": "Expanded to 20 teams in 2025/26, up from 18 previously.",
+    "expected_keywords": ["20 teams", "18"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — EuroLeague slide"
+  },
+  {
+    "id": "f1-2025-revenue",
+    "question": "What was Formula 1's total revenue in 2025?",
+    "expected_answer": "$3.87bn, up 14% year-over-year.",
+    "expected_keywords": ["3.87bn"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — Formula 1 slide"
+  },
+  {
+    "id": "nhl-2024-media-rights-revenue",
+    "question": "What was the NHL's global media-rights revenue in 2024?",
+    "expected_answer": "~$1.525bn (€1.35bn).",
+    "expected_keywords": ["1.525bn"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — NHL slide"
+  },
+  {
+    "id": "wta-2025-rights-value",
+    "question": "What was the WTA's combined media, betting and data rights value in 2025?",
+    "expected_answer": "~US$100m (€85.8m), weighted roughly 60% betting/data and 40% traditional media rights.",
+    "expected_keywords": ["100m"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — WTA slide"
+  },
+  {
+    "id": "wimbledon-2026-revenue",
+    "question": "How much media-rights revenue is Wimbledon expected to generate in 2026?",
+    "expected_answer": ">$260m (€227.5m).",
+    "expected_keywords": ["260m"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — Wimbledon slide"
+  },
+  {
+    "id": "pga-tour-2026-revenue",
+    "question": "What annual media-rights revenue is the PGA Tour expecting in 2026?",
+    "expected_answer": "Approaching $1bn, with approximately $900m expected in 2026.",
+    "expected_keywords": ["900m"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — PGA Tour slide"
+  },
+  {
+    "id": "cross-doc-common-broadcaster",
+    "question": "Which broadcaster appears in both Serie A's and LaLiga's DACH (Germany/Austria/Switzerland) media rights deals?",
+    "expected_answer": "DAZN holds the DACH rights for both Serie A and LaLiga.",
+    "expected_keywords": ["DAZN"],
+    "source": "SPORTS PROPERTIES OVERVIEW (1).pptx — Serie A + LaLiga slides (cross-source retrieval)"
+  },
+  {
+    "id": "balkan-image-cover-confidentiality",
+    "question": "What confidentiality marking appears on the cover page of the Balkan Markets deck?",
+    "expected_answer": "\"STRICTLY PRIVATE & CONFIDENTIAL\", beneath the SNI logo.",
+    "expected_keywords": ["confidential"],
+    "source": "Balkan Markets.pptx — cover slide (image-only page, extracted via Claude vision)"
+  },
+  {
+    "id": "balkan-households",
+    "question": "How many households do the six Balkan markets cover in total, and what is internet penetration across them?",
+    "expected_answer": "~6.8M households, with 83%+ internet penetration across all markets.",
+    "expected_keywords": ["6.8", "83%"],
+    "source": "Balkan Markets.pptx — market overview slide"
+  },
+  {
+    "id": "balkan-streaming-leader",
+    "question": "Which streaming service leads over Netflix across the Balkan markets?",
+    "expected_answer": "HBO leads Netflix in every one of the six Balkan markets.",
+    "expected_keywords": ["HBO", "Netflix"],
+    "source": "Balkan Markets.pptx — market overview slide"
+  }
+]

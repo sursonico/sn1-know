@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS entries (
     is_duplicate   INTEGER       DEFAULT 0,
     ocr_used       INTEGER       DEFAULT 0,
     ingest_error   TEXT          DEFAULT '',
+    validation_warning TEXT      DEFAULT '',
     status         TEXT          DEFAULT 'current',
     superseded_by  INTEGER       REFERENCES entries(id),
     deleted_at     TEXT,
@@ -190,6 +191,9 @@ def init_db(path: Path = DB_PATH) -> None:
             con.execute("ALTER TABLE entities ADD COLUMN deleted_at TEXT")
         if "deleted_with_entry" not in ent_cols:
             con.execute("ALTER TABLE entities ADD COLUMN deleted_with_entry INTEGER")
+        # Live migration: post-ingest validation flag on entries
+        if "validation_warning" not in e_cols:
+            con.execute("ALTER TABLE entries ADD COLUMN validation_warning TEXT DEFAULT ''")
 
 
 # ── Entry reads ─────────────────────────────────────────────────────────────
@@ -400,6 +404,12 @@ def upsert_document(
             is_duplicate, ocr_used, ingest_error, status, reliability,
         ))
         return cur.lastrowid
+
+
+def set_validation_warning(entry_id: int, warning: str, path: Path = DB_PATH) -> None:
+    """Set (or clear, with warning='') the post-ingest validation flag on an entry."""
+    with _conn(path) as con:
+        con.execute("UPDATE entries SET validation_warning=? WHERE id=?", (warning, entry_id))
 
 
 def add_snippet(

@@ -8,6 +8,7 @@ from kb.db import (
     get_entries_for_entity, get_deleted_entries, restore_entry, purge_entry,
     get_purgeable_entry_ids, purge_expired_deleted,
 )
+from kb.eval import run_case, load_eval_set, EVAL_SET_PATH
 from seed_entities import seed
 
 page_setup("admin", title="Admin — SN1 Knowledge Base")
@@ -28,9 +29,9 @@ _deleted_label = (
     f"Recently Deleted ({len(_deleted_entries)})" if _deleted_entries else "Recently Deleted"
 )
 
-tab_active, tab_proposed, tab_cleanup, tab_create, tab_deleted = st.tabs([
+tab_active, tab_proposed, tab_cleanup, tab_create, tab_deleted, tab_eval = st.tabs([
     "Active Entities", "Proposed (Pending Review)", "Cleanup — No Entries", "Create New",
-    _deleted_label,
+    _deleted_label, "Ask Eval Set",
 ])
 
 # ── Active entities ───────────────────────────────────────────────────────────
@@ -277,3 +278,55 @@ with tab_deleted:
                     else:
                         st.warning("That entry is no longer in the recycle bin.")
                     st.rerun()
+
+
+# ── Ask eval set: standing regression check against the live Ask pipeline ────
+with tab_eval:
+    section_title("Ask feature — standing eval set")
+    try:
+        cases = load_eval_set()
+    except Exception as e:
+        cases = []
+        st.error(f"Could not load {EVAL_SET_PATH.name}: {e}")
+
+    st.caption(
+        f"{len(cases)} known question/answer pairs pulled from documents already in the "
+        f"library ({EVAL_SET_PATH.name}). Each case passes only if every expected keyword "
+        f"shows up in Ask's live answer — this calls the real retrieval + LLM pipeline, "
+        f"so it costs one Ask query per case and takes a minute or two to run."
+    )
+
+    if cases and st.button("Run eval set", type="primary", key="run_eval"):
+        progress = st.progress(0.0, text="Running eval set…")
+        results = []
+        for i, case in enumerate(cases):
+            progress.progress((i) / len(cases), text=f"Running: {case['question'][:60]}")
+            results.append(run_case(case))
+        progress.progress(1.0, text="Done")
+        progress.empty()
+        st.session_state["eval_results"] = results
+
+    results = st.session_state.get("eval_results")
+    if results:
+        n_pass = sum(1 for r in results if r.passed)
+        n_total = len(results)
+        (st.success if n_pass == n_total else st.warning)(
+            f"{n_pass}/{n_total} passed"
+        )
+
+        for r in results:
+            icon = "✅" if r.passed else "❌"
+            with st.expander(f"{icon} {r.id} — {r.question}"):
+                st.caption(f"Source: {r.source}")
+                col_exp, col_act = st.columns(2)
+                with col_exp:
+                    st.markdown("**Expected**")
+                    st.write(r.expected_answer)
+                    st.caption("Required keywords: " + ", ".join(r.expected_keywords))
+                with col_act:
+                    st.markdown("**Actual (from Ask)**")
+                    st.write(r.actual_answer or "_(no answer returned)_")
+                    if not r.passed:
+                        st.caption("Missing: " + ", ".join(r.missing_keywords))
+                    if r.error:
+                        st.error(f"Error: {r.error}")

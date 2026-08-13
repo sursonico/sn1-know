@@ -143,7 +143,7 @@ n_d = int((filtered["entry_type"]=="document").sum()) if "entry_type" in filtere
 n_s = int((filtered["entry_type"]=="snippet").sum())  if "entry_type" in filtered else 0
 st.caption(f"Showing {len(filtered)} of {len(df)} entries — {n_d} documents, {n_s} snippets")
 
-cols = ["source","entry_type","reliability","file_type","entry_date","doc_type","sport_tags","org_tags","market_tags","summary","topic_tags"]
+cols = ["source","validation_warning","entry_type","reliability","file_type","entry_date","doc_type","sport_tags","org_tags","market_tags","summary","topic_tags"]
 show_cols = [c for c in cols if c in filtered.columns]
 
 # Tick 📄 to view the original file, 🗑 to delete. The editor is read-only apart
@@ -159,6 +159,12 @@ edited = st.data_editor(
     key=f"browse_editor_{st.session_state.get('browse_editor_nonce', 0)}",
     column_config={
         "source":      st.column_config.TextColumn("Source",        width="medium"),
+        "validation_warning": st.column_config.TextColumn(
+            "⚠ Review", width="medium",
+            help="Post-ingest check: extraction looked thin relative to file size, "
+                 "or a multi-page document linked far fewer entities than expected. "
+                 "Advisory only — the entry was still ingested.",
+        ),
         "entry_type":  st.column_config.TextColumn("Type",          width="small"),
         "reliability": st.column_config.TextColumn("Reliability",   width="small"),
         "file_type":   st.column_config.TextColumn("Format",        width="small"),

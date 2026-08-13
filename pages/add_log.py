@@ -84,6 +84,7 @@ with tab_add:
             elif len(summary) < 100:      thin.append("summary is short")
             if not entities:              thin.append("no entities linked")
             if entry.get("ingest_error"): thin.append(entry["ingest_error"][:60])
+            if entry.get("validation_warning"): thin.append(entry["validation_warning"])
 
             # ── Card header ───────────────────────────────────────────────────
             thin_badge = (

@@ -24,6 +24,8 @@ from config import (
     DOCS_DIR, DB_PATH, INGEST_BATCH_SIZE,
     MAX_CHARS_PER_DOC, MAX_CHARS_PER_CHUNK, OCR_CHAR_THRESHOLD,
     VISION_CHAR_THRESHOLD, VISION_IMAGE_COUNT_THRESHOLD, VISION_HYBRID_MAX_CHARS,
+    VALIDATION_MIN_FILE_BYTES, VALIDATION_MIN_CHARS_PER_KB,
+    VALIDATION_MIN_CHUNKS_FOR_ENTITY_CHECK,
 )
 from kb import db
 from kb.files import store_path, clear_lookup_cache
@@ -436,6 +438,52 @@ def find_possible_duplicate(source: str, existing_sources: list[str]) -> Optiona
     return None
 
 
+# ── Post-ingest validation (advisory — never blocks ingestion) ───────────────
+
+def _compute_validation_warning(
+    result: "ExtractionResult",
+    file_size_bytes: int,
+    n_entities: int,
+) -> str:
+    """
+    Flag likely-incomplete ingestion so it can be surfaced for human review.
+    Never raises and never affects ingestion — a purely advisory signal.
+
+    Two independent checks, joined if both fire:
+      1. Thin extraction: total extracted chars are low relative to file size.
+         Skipped below VALIDATION_MIN_FILE_BYTES so small, legitimately sparse
+         files (a one-line note, a short single-page PDF) aren't flagged.
+      2. Low entity yield: a document with enough pages/slides to plausibly be
+         multi-topic (>= VALIDATION_MIN_CHUNKS_FOR_ENTITY_CHECK) produced far
+         fewer distinct entities than sections — the exact pattern that hid the
+         SPORTS PROPERTIES OVERVIEW group-shape extraction bug (13 slides, 0
+         entities).
+    """
+    warnings: list[str] = []
+    n_chunks = len(result.chunks)
+    total_chars = sum(len(c.text) for c in result.chunks)
+
+    if file_size_bytes >= VALIDATION_MIN_FILE_BYTES:
+        chars_per_kb = total_chars / (file_size_bytes / 1024)
+        if chars_per_kb < VALIDATION_MIN_CHARS_PER_KB:
+            warnings.append(
+                f"Thin extraction: {total_chars:,} chars from a "
+                f"{file_size_bytes/1024:.0f}KB file ({chars_per_kb:.0f} chars/KB)"
+            )
+
+    if n_chunks >= VALIDATION_MIN_CHUNKS_FOR_ENTITY_CHECK:
+        expected_min = max(1, n_chunks // 6)
+        if n_entities < expected_min:
+            warnings.append(
+                f"Only {n_entities} entit{'y' if n_entities == 1 else 'ies'} linked "
+                f"across {n_chunks} slides/pages"
+            )
+
+    if not warnings:
+        return ""
+    return "⚠ " + " · ".join(warnings) + " — may be incomplete extraction, review before relying on it."
+
+
 # ── Single-file ingestion ─────────────────────────────────────────────────────
 
 async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
@@ -540,6 +588,7 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
                 n_entities += 1
     except Exception as e:
         log.warning("Entity resolution failed for %s: %s", source, e)
+        resolved = []
         n_entities = 0
 
     # Extract and store structured deals
@@ -579,11 +628,16 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
     except Exception as e:
         log.warning("Deal extraction failed for %s: %s", source, e)
 
+    # Post-ingest validation: advisory only, never blocks — see docstring.
+    warning = _compute_validation_warning(result, path.stat().st_size, n_entities)
+    db.set_validation_warning(entry_id, warning)
+
     flag = " [possible duplicate]" if is_dup else ""
     flag += " [OCR]" if result.ocr_used else ""
     n_vision = sum(1 for c in result.chunks if "[Vision-extracted]" in c.text)
     flag += f" [vision:{n_vision}]" if n_vision else ""
     flag += f" ({n_entities} entities, {n_deals} deals)"
+    flag += " [⚠ NEEDS REVIEW]" if warning else ""
     return f"OK    {source}{flag}"
 
 

@@ -38,6 +38,13 @@ STAGE2_MULTISOURCE_MAX_CHUNKS = 120  # raised budget when a question spans 3+ di
 STAGE2_FALLBACK_MAX_CHUNKS = 200  # Stage 1 failed → wide catalogue sweep needs room to find the answer
 CONVERSATION_HISTORY  = 2       # prior turns included in follow-up context
 
+# ── Post-ingest validation ───────────────────────────────────────────────────
+# Advisory only — never blocks ingestion, just flags entries.validation_warning
+# for review. See kb.ingest._compute_validation_warning().
+VALIDATION_MIN_FILE_BYTES        = int(os.getenv("SN1_VALIDATION_MIN_FILE_BYTES", "20000"))
+VALIDATION_MIN_CHARS_PER_KB      = int(os.getenv("SN1_VALIDATION_MIN_CHARS_PER_KB", "40"))
+VALIDATION_MIN_CHUNKS_FOR_ENTITY_CHECK = int(os.getenv("SN1_VALIDATION_MIN_CHUNKS", "5"))
+
 # ── Deletion ────────────────────────────────────────────────────────────────
 # Soft-deleted entries stay recoverable in Admin → Recently Deleted for this many
 # days. Nothing is purged automatically; the Admin page offers a manual purge of
