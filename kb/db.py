@@ -459,6 +459,12 @@ def update_enrichment(entry_id: int, path: Path = DB_PATH, **fields) -> None:
 
 # ── Chunk writes ─────────────────────────────────────────────────────────────
 
+def update_chunk_text(chunk_id: int, text: str, path: Path = DB_PATH) -> None:
+    """Overwrite a single chunk's text (manual correction). Caller re-indexes."""
+    with _conn(path) as con:
+        con.execute("UPDATE chunks SET text=? WHERE id=?", (text, chunk_id))
+
+
 def store_chunks(
     entry_id: int, chunks: list[Chunk], path: Path = DB_PATH
 ) -> list[int]:

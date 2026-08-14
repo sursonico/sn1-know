@@ -3,7 +3,7 @@ import asyncio
 from datetime import date
 from pathlib import Path
 import streamlit as st
-from kb.ui import page_setup, section_title, reliability_badge_html
+from kb.ui import page_setup, section_title, reliability_badge_html, ENTITY_TYPE_META
 from kb.db import (
     add_snippet, index_entry, get_entries_needing_enrichment,
     update_enrichment, init_db,
@@ -11,13 +11,17 @@ from kb.db import (
     get_recent_entries_for_entities, mark_entry_superseded,
     add_deal, find_entity_by_name_or_alias,
     get_entities_for_entry, get_chunks_for_entries, get_all_entries,
+    get_all_entities, update_chunk_text, set_validation_warning,
 )
 from kb.llm import (
     enrich_snippet, enrich_url_article, enrich_document,
     resolve_entities, check_new_entry_conflicts, extract_deals,
 )
 from kb.files import resolve_source_file
-from kb.ingest import ingest_all_async, extract as extract_file, full_text as _ft
+from kb.ingest import (
+    ingest_all_async, extract as extract_file, full_text as _ft,
+    _compute_validation_warning, _render_pdf_page_image, _extract_pptx_slide_images,
+)
 from kb.web import fetch_article, error_message
 from config import DOCS_DIR
 
@@ -29,6 +33,275 @@ _ETYPE_COLORS = {
     "competition": "#AA925C", "federation": "#2B383E", "broadcaster": "#2A7F7F",
     "market": "#5B7B8A", "rights_holder": "#7B5B2A", "club": "#4A7B4A", "other": "#8A9598",
 }
+
+
+@st.cache_data(show_spinner=False)
+def _page_thumbnail(path_str: str, mtime: float, chunk_type: str, page_idx: int):
+    """
+    Best-effort page/slide image for visual comparison against extracted text.
+    Returns PNG/JPEG bytes, or None when no image is available for this format/page.
+    PDF pages render fully (pymupdf/pdfplumber). PPTX has no full-slide rendering
+    available via python-pptx — only embedded picture blobs are shown, so a
+    text-only slide (e.g. a grouped-shapes layout with no images) has none.
+    XLSX sheets have no visual form at all.
+    """
+    path = Path(path_str)
+    ext = path.suffix.lower()
+    if ext == ".pdf":
+        return _render_pdf_page_image(path, page_idx)
+    if ext == ".pptx":
+        blobs, _ = _extract_pptx_slide_images(path, page_idx)
+        return blobs[0] if blobs else None
+    return None
+
+def _render_page_editor(entry: dict, chunk: dict, src_path) -> None:
+    """
+    One page/slide's manual-review block: extracted text next to a rendered
+    thumbnail (when available), an editable text box pre-filled with the
+    extracted text, and an entity tagger. Nothing is saved here — values live
+    in widget state (keyed by chunk id) until "Save corrections" is clicked.
+    """
+    cid   = chunk["id"]
+    text  = chunk.get("text") or ""
+    label = f"{chunk.get('chunk_type', 'page').capitalize()} {chunk['chunk_num']}"
+    is_empty = not text.strip()
+    header = f"{'⚠ ' if is_empty else ''}{label}" + (
+        "  ·  (empty — nothing extracted)" if is_empty else f"  ·  {len(text)} chars"
+    )
+
+    with st.expander(header, expanded=False):
+        col_text, col_img = st.columns([3, 2])
+        with col_text:
+            st.caption("Extracted text (as currently stored)")
+            st.text(text if text.strip() else "_(nothing extracted for this page)_")
+        with col_img:
+            st.caption("Page image")
+            thumb = None
+            if src_path is not None:
+                try:
+                    thumb = _page_thumbnail(str(src_path), src_path.stat().st_mtime, chunk.get("chunk_type", ""), chunk["chunk_num"] - 1)
+                except Exception:
+                    thumb = None
+            if thumb:
+                st.image(thumb, use_container_width=True)
+            else:
+                st.caption(
+                    "_No rendered image available — PDF pages render fully, but "
+                    "PowerPoint slides can only show an embedded picture (python-pptx "
+                    "can't rasterize a full slide layout), and Excel sheets have no "
+                    "visual form._"
+                )
+
+        st.text_area(
+            "Correct this page's text",
+            value=text,
+            height=140,
+            key=f"pgtxt_{cid}",
+            help="Pre-filled with whatever was extracted, even if empty or wrong — "
+                 "edit or replace it entirely, then use Save corrections below.",
+        )
+
+        all_names = [e["canonical_name"] for e in get_all_entities(include_proposed=True)]
+        st.multiselect(
+            "This page is about (entities)",
+            options=all_names,
+            key=f"pgent_{cid}",
+            accept_new_options=True,
+            placeholder="Pick existing entities or type a new name and press enter",
+            help="New names become proposed entities (type 'other') — finish "
+                 "classifying them in Admin → Proposed (Pending Review).",
+        )
+
+
+def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int]:
+    """
+    Apply every pgtxt_/pgent_ widget value for this entry's chunks: update
+    changed chunk text, link any newly-tagged entities, re-index, and
+    recompute the validation banner from the corrected data. Returns
+    (n_text_edits, n_entities_added).
+    """
+    eid = entry["id"]
+    n_text_edits = 0
+    tagged_names: set[str] = set()
+
+    for chunk in chunks:
+        cid = chunk["id"]
+        new_text = st.session_state.get(f"pgtxt_{cid}", chunk.get("text") or "")
+        if new_text != (chunk.get("text") or ""):
+            update_chunk_text(cid, new_text)
+            n_text_edits += 1
+        tagged_names.update(st.session_state.get(f"pgent_{cid}", []) or [])
+
+    n_entities_added = 0
+    for name in tagged_names:
+        name = name.strip()
+        if not name:
+            continue
+        existing = find_entity_by_name_or_alias(name)
+        if existing:
+            entity_id = existing["id"]
+        else:
+            entity_id = find_or_create_entity(name, "other", proposed=True)
+        link_entry_to_entity(eid, entity_id, role="primary")
+        n_entities_added += 1
+
+    index_entry(eid)
+
+    fresh_chunks = get_chunks_for_entries([eid]).get(eid, [])
+    fresh_entities = get_entities_for_entry(eid)
+    file_size = 0
+    src_path = resolve_source_file(entry)
+    if src_path is not None:
+        try:
+            file_size = src_path.stat().st_size
+        except OSError:
+            file_size = 0
+    warning = _compute_validation_warning(
+        [c.get("text") or "" for c in fresh_chunks], file_size, len(fresh_entities),
+    )
+    set_validation_warning(eid, warning)
+
+    return n_text_edits, n_entities_added
+
+
+def _render_review_card(entry: dict) -> None:
+    fname     = entry.get("source", "(untitled)")
+    eid       = entry["id"]
+    summary   = entry.get("summary") or ""
+    chunks_by = get_chunks_for_entries([eid])
+    chunks    = chunks_by.get(eid, [])
+    n_pages   = len(chunks)
+    entities  = get_entities_for_entry(eid)
+    rel       = entry.get("reliability", "reported") or "reported"
+
+    thin = []
+    if not summary.strip():       thin.append("no summary extracted")
+    elif len(summary) < 100:      thin.append("summary is short")
+    if not entities:              thin.append("no entities linked")
+    if entry.get("ingest_error"): thin.append(entry["ingest_error"][:60])
+    if entry.get("validation_warning"): thin.append(entry["validation_warning"])
+
+    # ── Card header ───────────────────────────────────────────────────
+    thin_badge = (
+        '&nbsp;<span style="font-size:0.7rem;background:#fff3cd;color:#856404;'
+        'padding:2px 7px;border-radius:10px;font-weight:600">⚠ THIN</span>'
+    ) if thin else ""
+    st.markdown(
+        f'<div style="margin-top:0.9rem">'
+        f'<span style="font-weight:600;font-size:0.95rem;color:#2B383E">📄 {fname}</span>'
+        f'&nbsp;&nbsp;<span style="font-size:0.7rem;background:#d4edda;color:#155724;'
+        f'padding:2px 7px;border-radius:10px;font-weight:600">✓ INGESTED</span>'
+        f'{thin_badge}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Metrics
+    m_parts = []
+    if n_pages:               m_parts.append(f"{n_pages} page{'s' if n_pages!=1 else ''}")
+    if entry.get("doc_type"): m_parts.append(entry["doc_type"])
+    m_parts.append(f"reliability: {rel}")
+    st.caption(" · ".join(m_parts))
+
+    # Summary preview
+    if summary:
+        st.markdown(
+            f'<div style="font-size:0.86rem;color:#444;margin:0.15rem 0 0.25rem">'
+            f'{summary[:300]}{"…" if len(summary)>300 else ""}</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("_(no summary extracted)_")
+
+    # Tags
+    t_parts = []
+    if entry.get("org_tags"):    t_parts.append(f"**Org:** {entry['org_tags']}")
+    if entry.get("market_tags"): t_parts.append(f"**Markets:** {entry['market_tags']}")
+    if entry.get("sport_tags"):  t_parts.append(f"**Sport:** {entry['sport_tags']}")
+    if entry.get("topic_tags"):  t_parts.append(f"**Topics:** {entry['topic_tags']}")
+    if t_parts:
+        st.markdown("  ·  ".join(t_parts))
+    else:
+        st.caption("_(no tags extracted)_")
+
+    # Entities
+    if entities:
+        badges = []
+        for en in entities:
+            c = _ETYPE_COLORS.get(en.get("entity_type", "other"), "#8A9598")
+            badges.append(
+                f'<span style="font-size:0.65rem;font-weight:700;text-transform:uppercase;'
+                f'color:{c}">{en["entity_type"]}</span>'
+                f'&nbsp;<span style="font-size:0.82rem">{en["canonical_name"]}</span>'
+            )
+        st.markdown(
+            '<div style="margin:0.2rem 0">' + "&ensp;·&ensp;".join(badges) + "</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Thin warning
+    if thin:
+        st.warning("⚠ Low-confidence extraction  ·  " + "  ·  ".join(thin), icon=None)
+
+    # ── Manual per-page review ───────────────────────────────────────────
+    if chunks:
+        st.markdown("**Pages** — review extracted text and images, correct or tag each one:")
+        src_path = resolve_source_file(entry)
+        for chunk in chunks:
+            _render_page_editor(entry, chunk, src_path)
+
+        if st.button("💾 Save corrections", type="primary", key=f"save_corrections_{eid}"):
+            n_edits, n_added = _save_page_corrections(entry, chunks)
+            st.session_state[f"corrections_saved_{eid}"] = (n_edits, n_added)
+            st.rerun()
+
+        saved = st.session_state.pop(f"corrections_saved_{eid}", None)
+        if saved:
+            n_edits, n_added = saved
+            st.success(
+                f"Saved — {n_edits} page{'s' if n_edits != 1 else ''} text-corrected, "
+                f"{n_added} entity link{'s' if n_added != 1 else ''} applied. Re-indexed "
+                f"for Ask, and the validation check has re-run (see the badge above)."
+            )
+
+    # Inline edit
+    with st.expander("✏  Edit tags & summary"):
+        fe_sum = st.text_area("Summary", value=summary, height=80, key=f"fe_sum_{eid}")
+        fd1, fd2 = st.columns(2)
+        fe_date = fd1.text_input(
+            "Content date",
+            value=entry.get("entry_date", ""),
+            key=f"fe_date_{eid}",
+            placeholder="e.g. 2024, 2024-03",
+            help="When this document was written or published.",
+        )
+        fe_cov = fd2.text_input(
+            "Rights period covered",
+            value=entry.get("coverage_period", ""),
+            key=f"fe_cov_{eid}",
+            placeholder="e.g. 2025-2028",
+            help="The rights cycle this document describes, if different from the content date.",
+        )
+        c1, c2 = st.columns(2)
+        fe_org = c1.text_input("Organisations", value=entry.get("org_tags", ""), key=f"fe_org_{eid}")
+        fe_mkt = c2.text_input("Markets",       value=entry.get("market_tags", ""), key=f"fe_mkt_{eid}")
+        c3, c4 = st.columns(2)
+        fe_spt = c3.text_input("Sport / League", value=entry.get("sport_tags", ""), key=f"fe_spt_{eid}")
+        fe_top = c4.text_input("Topics",         value=entry.get("topic_tags", ""), key=f"fe_top_{eid}")
+        rels    = ["confirmed", "reported", "rumoured"]
+        cur_rel = rel if rel in rels else "reported"
+        fe_rel  = st.selectbox("Reliability", rels, index=rels.index(cur_rel), key=f"fe_rel_{eid}")
+        if st.button("Save changes", type="secondary", key=f"fe_save_{eid}"):
+            update_enrichment(eid, summary=fe_sum, entry_date=fe_date, coverage_period=fe_cov,
+                              org_tags=fe_org, market_tags=fe_mkt,
+                              sport_tags=fe_spt, topic_tags=fe_top, reliability=fe_rel)
+            index_entry(eid)
+            st.session_state[f"fe_saved_{eid}"] = True
+
+    if st.session_state.pop(f"fe_saved_{eid}", False):
+        st.success(f"Updated **{fname}**")
+
+    st.divider()
+
 
 # ── Add Documents ─────────────────────────────────────────────────────────────
 with tab_add:
@@ -71,127 +344,7 @@ with tab_add:
                 st.warning(f"📄 **{fname}** — processed but entry not found in database")
                 continue
 
-            eid       = entry["id"]
-            summary   = entry.get("summary") or ""
-            chunks_by = get_chunks_for_entries([eid])
-            chunks    = chunks_by.get(eid, [])
-            n_pages   = len(chunks)
-            entities  = get_entities_for_entry(eid)
-            rel       = entry.get("reliability", "reported") or "reported"
-
-            thin = []
-            if not summary.strip():       thin.append("no summary extracted")
-            elif len(summary) < 100:      thin.append("summary is short")
-            if not entities:              thin.append("no entities linked")
-            if entry.get("ingest_error"): thin.append(entry["ingest_error"][:60])
-            if entry.get("validation_warning"): thin.append(entry["validation_warning"])
-
-            # ── Card header ───────────────────────────────────────────────────
-            thin_badge = (
-                '&nbsp;<span style="font-size:0.7rem;background:#fff3cd;color:#856404;'
-                'padding:2px 7px;border-radius:10px;font-weight:600">⚠ THIN</span>'
-            ) if thin else ""
-            st.markdown(
-                f'<div style="margin-top:0.9rem">'
-                f'<span style="font-weight:600;font-size:0.95rem;color:#2B383E">📄 {fname}</span>'
-                f'&nbsp;&nbsp;<span style="font-size:0.7rem;background:#d4edda;color:#155724;'
-                f'padding:2px 7px;border-radius:10px;font-weight:600">✓ INGESTED</span>'
-                f'{thin_badge}</div>',
-                unsafe_allow_html=True,
-            )
-
-            # Metrics
-            m_parts = []
-            if n_pages:               m_parts.append(f"{n_pages} page{'s' if n_pages!=1 else ''}")
-            if entry.get("doc_type"): m_parts.append(entry["doc_type"])
-            m_parts.append(f"reliability: {rel}")
-            st.caption(" · ".join(m_parts))
-
-            # Summary preview
-            if summary:
-                st.markdown(
-                    f'<div style="font-size:0.86rem;color:#444;margin:0.15rem 0 0.25rem">'
-                    f'{summary[:300]}{"…" if len(summary)>300 else ""}</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.caption("_(no summary extracted)_")
-
-            # Tags
-            t_parts = []
-            if entry.get("org_tags"):    t_parts.append(f"**Org:** {entry['org_tags']}")
-            if entry.get("market_tags"): t_parts.append(f"**Markets:** {entry['market_tags']}")
-            if entry.get("sport_tags"):  t_parts.append(f"**Sport:** {entry['sport_tags']}")
-            if entry.get("topic_tags"):  t_parts.append(f"**Topics:** {entry['topic_tags']}")
-            if t_parts:
-                st.markdown("  ·  ".join(t_parts))
-            else:
-                st.caption("_(no tags extracted)_")
-
-            # Entities
-            if entities:
-                badges = []
-                for en in entities:
-                    c = _ETYPE_COLORS.get(en.get("entity_type", "other"), "#8A9598")
-                    badges.append(
-                        f'<span style="font-size:0.65rem;font-weight:700;text-transform:uppercase;'
-                        f'color:{c}">{en["entity_type"]}</span>'
-                        f'&nbsp;<span style="font-size:0.82rem">{en["canonical_name"]}</span>'
-                    )
-                st.markdown(
-                    '<div style="margin:0.2rem 0">' + "&ensp;·&ensp;".join(badges) + "</div>",
-                    unsafe_allow_html=True,
-                )
-
-            # Thin warning
-            if thin:
-                st.warning("⚠ Low-confidence extraction  ·  " + "  ·  ".join(thin), icon=None)
-
-            # Text preview (collapsed)
-            if chunks:
-                first_text = (chunks[0].get("text") or "")[:600]
-                trunc = len(chunks[0].get("text", "")) > 600 or len(chunks) > 1
-                with st.expander(f"Text preview  ·  page 1 of {n_pages}", expanded=False):
-                    st.text(first_text + ("…" if trunc else ""))
-
-            # Inline edit
-            with st.expander("✏  Edit tags & summary"):
-                fe_sum = st.text_area("Summary", value=summary, height=80, key=f"fe_sum_{eid}")
-                fd1, fd2 = st.columns(2)
-                fe_date = fd1.text_input(
-                    "Content date",
-                    value=entry.get("entry_date", ""),
-                    key=f"fe_date_{eid}",
-                    placeholder="e.g. 2024, 2024-03",
-                    help="When this document was written or published.",
-                )
-                fe_cov = fd2.text_input(
-                    "Rights period covered",
-                    value=entry.get("coverage_period", ""),
-                    key=f"fe_cov_{eid}",
-                    placeholder="e.g. 2025-2028",
-                    help="The rights cycle this document describes, if different from the content date.",
-                )
-                c1, c2 = st.columns(2)
-                fe_org = c1.text_input("Organisations", value=entry.get("org_tags", ""), key=f"fe_org_{eid}")
-                fe_mkt = c2.text_input("Markets",       value=entry.get("market_tags", ""), key=f"fe_mkt_{eid}")
-                c3, c4 = st.columns(2)
-                fe_spt = c3.text_input("Sport / League", value=entry.get("sport_tags", ""), key=f"fe_spt_{eid}")
-                fe_top = c4.text_input("Topics",         value=entry.get("topic_tags", ""), key=f"fe_top_{eid}")
-                rels    = ["confirmed", "reported", "rumoured"]
-                cur_rel = rel if rel in rels else "reported"
-                fe_rel  = st.selectbox("Reliability", rels, index=rels.index(cur_rel), key=f"fe_rel_{eid}")
-                if st.button("Save changes", type="secondary", key=f"fe_save_{eid}"):
-                    update_enrichment(eid, summary=fe_sum, entry_date=fe_date, coverage_period=fe_cov,
-                                      org_tags=fe_org, market_tags=fe_mkt,
-                                      sport_tags=fe_spt, topic_tags=fe_top, reliability=fe_rel)
-                    index_entry(eid)
-                    st.session_state[f"fe_saved_{eid}"] = True
-
-            if st.session_state.pop(f"fe_saved_{eid}", False):
-                st.success(f"Updated **{fname}**")
-
-            st.divider()
+            _render_review_card(entry)
 
         if st.button("Done reviewing", type="primary", key="doc_review_done"):
             st.session_state.pop("doc_review", None)
@@ -227,6 +380,30 @@ with tab_add:
                 "statuses": results,
             }
             st.rerun()
+
+        # ── Review or correct an existing document ─────────────────────────────────
+        st.divider()
+        with st.expander("🔍 Review or correct an existing document"):
+            st.caption(
+                "Open any previously-ingested document in the same per-page review tool "
+                "shown right after upload — flagged documents (⚠) are listed first."
+            )
+            doc_entries = [e for e in get_all_entries() if e.get("entry_type") == "document"]
+            doc_entries.sort(key=lambda e: (not e.get("validation_warning"), e.get("source", "")))
+            if not doc_entries:
+                st.info("No documents in the library yet.")
+            else:
+                options = {
+                    f"{'⚠ ' if e.get('validation_warning') else ''}{e['source']}": e["id"]
+                    for e in doc_entries
+                }
+                choice = st.selectbox(
+                    "Document", list(options.keys()),
+                    key="existing_doc_picker", label_visibility="collapsed",
+                )
+                chosen_id = options[choice]
+                chosen_entry = next(e for e in doc_entries if e["id"] == chosen_id)
+                _render_review_card(chosen_entry)
 
         # ── Backfill ──────────────────────────────────────────────────────────────
         st.divider()

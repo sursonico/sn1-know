@@ -441,13 +441,18 @@ def find_possible_duplicate(source: str, existing_sources: list[str]) -> Optiona
 # ── Post-ingest validation (advisory — never blocks ingestion) ───────────────
 
 def _compute_validation_warning(
-    result: "ExtractionResult",
+    chunk_texts: list[str],
     file_size_bytes: int,
     n_entities: int,
 ) -> str:
     """
     Flag likely-incomplete ingestion so it can be surfaced for human review.
     Never raises and never affects ingestion — a purely advisory signal.
+
+    Takes plain chunk text (not an ExtractionResult) so the Add & Log manual
+    review UI can re-run this exact check after a human edits chunk text or
+    adds entity links, using data read straight back from the DB — see
+    pages/add_log.py's "Save corrections" flow.
 
     Two independent checks, joined if both fire:
       1. Thin extraction: total extracted chars are low relative to file size.
@@ -460,8 +465,8 @@ def _compute_validation_warning(
          entities).
     """
     warnings: list[str] = []
-    n_chunks = len(result.chunks)
-    total_chars = sum(len(c.text) for c in result.chunks)
+    n_chunks = len(chunk_texts)
+    total_chars = sum(len(t) for t in chunk_texts)
 
     if file_size_bytes >= VALIDATION_MIN_FILE_BYTES:
         chars_per_kb = total_chars / (file_size_bytes / 1024)
@@ -629,7 +634,9 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
         log.warning("Deal extraction failed for %s: %s", source, e)
 
     # Post-ingest validation: advisory only, never blocks — see docstring.
-    warning = _compute_validation_warning(result, path.stat().st_size, n_entities)
+    warning = _compute_validation_warning(
+        [c.text for c in result.chunks], path.stat().st_size, n_entities,
+    )
     db.set_validation_warning(entry_id, warning)
 
     flag = " [possible duplicate]" if is_dup else ""
