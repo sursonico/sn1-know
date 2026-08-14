@@ -9,7 +9,7 @@ from kb.db import (
     update_enrichment, init_db,
     find_or_create_entity, link_entry_to_entity,
     get_recent_entries_for_entities, mark_entry_superseded,
-    add_deal, find_entity_by_name_or_alias,
+    add_deal, update_deal, get_deals_for_entity, find_entity_by_name_or_alias,
     get_entities_for_entry, get_chunks_for_entries, get_all_entries,
     get_all_entities, update_chunk_text, set_validation_warning,
 )
@@ -53,6 +53,95 @@ def _page_thumbnail(path_str: str, mtime: float, chunk_type: str, page_idx: int)
         blobs, _ = _extract_pptx_slide_images(path, page_idx)
         return blobs[0] if blobs else None
     return None
+
+_DEAL_CURRENCIES = ["", "GBP", "EUR", "USD", "AUD", "CAD", "Other"]
+_DEAL_STATUSES = ["current", "unverified"]
+_DEAL_RELIABILITY = ["confirmed", "reported", "rumoured"]
+
+
+def _render_deal_editor(entity_row: dict, entry: dict, cid: int) -> None:
+    """
+    Structured deal entry/correction for one entity, scoped to one page — this
+    is the write that actually populates the entity hub's rights table
+    (kb.db.get_deals_for_entity / the `deals` table). Entity tagging alone
+    (link_entry_to_entity) never touches this table, which is why this is a
+    separate control rather than something "Save corrections" infers.
+
+    Uses the same fields and add_deal()/update_deal() calls as the "Add a deal
+    manually" form on the entity hub page (pages/entity.py), but also stamps
+    source_entry_id/source_note to this document since we know exactly where
+    the terms came from.
+    """
+    entity_id = entity_row["id"]
+    entity_name = entity_row["canonical_name"]
+    key = f"deal_{cid}_{entity_id}"
+
+    st.markdown(f"**Deal terms — {entity_name}**")
+    existing = get_deals_for_entity(entity_id, include_superseded=False)
+    if existing:
+        for d in existing:
+            bits = [d.get("territory") or "?", d.get("broadcaster") or "?"]
+            if d.get("value"):
+                bits.append(f"{d.get('currency','')} {d['value']}m{(' ' + d['value_note']) if d.get('value_note') else ''}")
+            period = "–".join(p for p in [d.get("period_start"), d.get("period_end")] if p)
+            if period:
+                bits.append(period)
+            st.caption(f"#{d['id']} · " + "  ·  ".join(str(b) for b in bits if b))
+    else:
+        st.caption("_No deal rows for this entity yet — the rights table on its hub page is empty._")
+
+    edit_opts = {"➕ Add new deal": None}
+    for d in existing:
+        edit_opts[f"✏ Edit #{d['id']} — {d.get('territory','?')} / {d.get('broadcaster','?')}"] = d
+    choice = st.selectbox("Add or edit", list(edit_opts.keys()), key=f"{key}_choice")
+    editing = edit_opts[choice]
+
+    with st.form(f"{key}_form_{choice}"):
+        fa1, fa2 = st.columns(2)
+        d_territory   = fa1.text_input("Territory *",   value=(editing or {}).get("territory", ""))
+        d_broadcaster = fa2.text_input("Broadcaster *", value=(editing or {}).get("broadcaster", ""))
+        fb1, fb2 = st.columns(2)
+        d_rights_holder = fb1.text_input("Rights holder", value=(editing or {}).get("rights_holder", ""))
+        d_platform      = fb2.text_input("Platform",      value=(editing or {}).get("platform", ""))
+        fc1, fc2, fc3 = st.columns(3)
+        d_value = fc1.number_input("Value (millions)", min_value=0.0, value=float((editing or {}).get("value") or 0.0), step=0.1, format="%.2f")
+        cur_default = (editing or {}).get("currency", "")
+        d_currency = fc2.selectbox("Currency", _DEAL_CURRENCIES, index=_DEAL_CURRENCIES.index(cur_default) if cur_default in _DEAL_CURRENCIES else 0)
+        d_value_note = fc3.text_input("Qualifier", value=(editing or {}).get("value_note", ""))
+        fd1, fd2 = st.columns(2)
+        d_period_start = fd1.text_input("Period start", value=(editing or {}).get("period_start", ""))
+        d_period_end   = fd2.text_input("Period end",   value=(editing or {}).get("period_end", ""))
+        st_default  = (editing or {}).get("status", "current")
+        rel_default = (editing or {}).get("reliability", "reported")
+        fe1, fe2 = st.columns(2)
+        d_status      = fe1.selectbox("Status",      _DEAL_STATUSES,    index=_DEAL_STATUSES.index(st_default) if st_default in _DEAL_STATUSES else 0)
+        d_reliability = fe2.selectbox("Reliability", _DEAL_RELIABILITY, index=_DEAL_RELIABILITY.index(rel_default) if rel_default in _DEAL_RELIABILITY else 1)
+        submitted = st.form_submit_button("Update deal" if editing else "Save deal", type="primary")
+
+    if submitted:
+        if not d_territory.strip() or not d_broadcaster.strip():
+            st.error("Territory and Broadcaster are required.")
+        else:
+            fields = dict(
+                territory=d_territory.strip(), broadcaster=d_broadcaster.strip(),
+                rights_holder=d_rights_holder.strip(), platform=d_platform.strip(),
+                value=(d_value if d_value > 0 else None),
+                currency=(d_currency if d_currency != "Other" else ""),
+                value_note=d_value_note.strip(),
+                period_start=d_period_start.strip(), period_end=d_period_end.strip(),
+                status=d_status, reliability=d_reliability,
+            )
+            if editing:
+                update_deal(editing["id"], **fields)
+                st.success(f"Updated deal #{editing['id']} for {entity_name}.")
+            else:
+                new_id = add_deal(
+                    entity_id=entity_id, source_entry_id=entry["id"],
+                    source_note=entry.get("source", ""), **fields,
+                )
+                st.success(f"Saved deal #{new_id} for {entity_name}.")
+            st.rerun()
+
 
 def _render_page_editor(entry: dict, chunk: dict, src_path) -> None:
     """
@@ -109,8 +198,20 @@ def _render_page_editor(entry: dict, chunk: dict, src_path) -> None:
             accept_new_options=True,
             placeholder="Pick existing entities or type a new name and press enter",
             help="New names become proposed entities (type 'other') — finish "
-                 "classifying them in Admin → Proposed (Pending Review).",
+                 "classifying them in Admin → Proposed (Pending Review). Tagging "
+                 "alone does not touch the rights table below — that's a separate "
+                 "write, see 'Deal terms' for each tagged entity.",
         )
+
+        for name in st.session_state.get(f"pgent_{cid}", []) or []:
+            entity_row = find_entity_by_name_or_alias(name.strip())
+            if entity_row:
+                _render_deal_editor(entity_row, entry, cid)
+            else:
+                st.caption(
+                    f"_'{name}' will be created as a new entity when you click Save "
+                    f"corrections — reopen this page afterward to add deal terms for it._"
+                )
 
 
 def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int]:
