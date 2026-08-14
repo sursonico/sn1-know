@@ -491,17 +491,53 @@ def _compute_validation_warning(
 
 # ── Single-file ingestion ─────────────────────────────────────────────────────
 
-async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
+async def _extract_deals_per_chunk(
+    chunks: list["Chunk"], canonical_names: list[str], source: str,
+) -> list[dict]:
+    """Run deal extraction on every chunk's full untruncated text, bounded to
+    DEAL_EXTRACT_CONCURRENCY concurrent calls (unbounded concurrency has been
+    observed to overload the claude-CLI fallback badly enough that calls that
+    would otherwise succeed time out purely from the contention). Returns the
+    flattened list of raw deal dicts across all chunks — nothing is written."""
+    if not canonical_names:
+        return []
+    sem = asyncio.Semaphore(DEAL_EXTRACT_CONCURRENCY)
+
+    async def _one(c):
+        async with sem:
+            hint = f"{source} — {c.chunk_type} {c.chunk_num}"
+            return await extract_deals_async(c.text, canonical_names, source_hint=hint)
+
+    per_chunk = await asyncio.gather(*[_one(c) for c in chunks])
+    return [d for chunk_deals in per_chunk for d in chunk_deals]
+
+
+async def ingest_file_async(path: Path, existing_sources: list[str], commit: bool = True) -> str:
     """
-    Ingest one file asynchronously. Returns a status string.
-    Does NOT commit the DB — the caller batches commits.
+    Ingest one file: extract, classify, resolve entities, extract deals.
+    Returns a status string.
+
+    commit=True (default) — the original behavior: every step writes straight
+    to the live schema as it completes. This is what the CLI batch tool
+    (`python -m kb.ingest`) and existing automation rely on; unchanged here.
+
+    commit=False — nothing is written to entries/chunks/entry_entities/deals.
+    Every extraction/classification/entity-resolution/deal-extraction step
+    still runs in full (so the work is never wasted, and re-opening a pending
+    draft doesn't re-pay for it), but the result is staged as one
+    draft_documents row via db.stage_draft_document(). See pages/add_log.py's
+    upload flow: nothing is live until the user explicitly confirms via
+    db.commit_draft_document(), which writes everything in one transaction.
     """
     source = path.name
-
-    # Skip if content hash already in DB
     h = content_hash(path)
+
     if db.hash_exists(h):
         return f"SKIP  {source} (unchanged)"
+    if not commit:
+        existing_draft_id = db.draft_exists(h)
+        if existing_draft_id:
+            return f"DRAFT {source} (already staged as draft #{existing_draft_id} — not re-extracted)"
 
     # Ensure the file lives inside DOCS_DIR so file_path is always managed.
     # If it came from an external path (e.g. CLI with an absolute arg), copy it in.
@@ -515,25 +551,39 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
     # Extract text chunks
     result = extract(path)
     if result.error:
-        entry_id = db.upsert_document(
-            source=source, file_type=result.file_type,
-            ingest_error=result.error, file_path=store_path(path),
-            content_hash=h,
-        )
-        log.warning("Extraction error for %s: %s", source, result.error)
-        return f"ERROR {source}: {result.error}"
+        if commit:
+            db.upsert_document(
+                source=source, file_type=result.file_type,
+                ingest_error=result.error, file_path=store_path(path),
+                content_hash=h,
+            )
+            log.warning("Extraction error for %s: %s", source, result.error)
+            return f"ERROR {source}: {result.error}"
+        draft_id = db.stage_draft_document({
+            "source": source, "content_hash": h, "file_path": store_path(path),
+            "file_type": result.file_type, "ingest_error": result.error,
+            "chunks": [], "entities": [], "deals": [],
+        })
+        return f"DRAFT-ERROR {source}: {result.error} [draft_id={draft_id}]"
 
     # Vision enrichment: fill in sparse/image-heavy pages with Claude vision
     result = await _vision_enrich_async(path, result)
 
     txt = full_text(result)
     if not txt.strip():
-        entry_id = db.upsert_document(
-            source=source, file_type=result.file_type,
-            ingest_error="No text extracted",
-            file_path=store_path(path), content_hash=h,
-        )
-        return f"EMPTY {source}"
+        if commit:
+            db.upsert_document(
+                source=source, file_type=result.file_type,
+                ingest_error="No text extracted",
+                file_path=store_path(path), content_hash=h,
+            )
+            return f"EMPTY {source}"
+        draft_id = db.stage_draft_document({
+            "source": source, "content_hash": h, "file_path": store_path(path),
+            "file_type": result.file_type, "ingest_error": "No text extracted",
+            "chunks": [], "entities": [], "deals": [],
+        })
+        return f"DRAFT-EMPTY {source} [draft_id={draft_id}]"
 
     # Classify with Haiku (async)
     try:
@@ -550,8 +600,30 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
         is_dup = 1
         log.info("Possible duplicate/version: %s (matches %s)", source, dup_of or "pattern")
 
-    # Write to DB
-    entry_id = db.upsert_document(
+    # Resolve entities — compute only, no writes yet (neither branch needs an
+    # entry_id for this: it only depends on `meta` and `source`).
+    try:
+        resolved = await resolve_entities_async(meta, source=source)
+    except Exception as e:
+        log.warning("Entity resolution failed for %s: %s", source, e)
+        resolved = []
+    n_entities = sum(1 for r in resolved if r.get("canonical", "").strip())
+
+    # Extract deals per chunk — compute only, no writes yet. See
+    # _extract_deals_per_chunk's docstring for the truncation/concurrency
+    # rationale.
+    all_raw_deals: list[dict] = []
+    try:
+        canonical_names = [r.get("canonical", "").strip() for r in resolved if r.get("canonical", "").strip()]
+        all_raw_deals = await _extract_deals_per_chunk(result.chunks, canonical_names, source)
+    except Exception as e:
+        log.warning("Deal extraction failed for %s: %s", source, e)
+
+    validation_warning = _compute_validation_warning(
+        [c.text for c in result.chunks], path.stat().st_size, n_entities,
+    )
+
+    common_fields = dict(
         source          = source,
         entry_date      = meta.get("doc_date", meta.get("time_period", "")),
         coverage_period = meta.get("coverage_period", ""),
@@ -570,98 +642,76 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
         reliability     = meta.get("reliability", "reported"),
     )
 
-    # Store page/slide chunks
+    n_vision = sum(1 for c in result.chunks if "[Vision-extracted]" in c.text)
+
+    if not commit:
+        draft_id = db.stage_draft_document({
+            **common_fields,
+            "validation_warning": validation_warning,
+            "chunks": [{"chunk_num": c.chunk_num, "chunk_type": c.chunk_type, "text": c.text} for c in result.chunks],
+            "entities": resolved,
+            "deals": all_raw_deals,
+        })
+        flag = " [possible duplicate]" if is_dup else ""
+        flag += f" [vision:{n_vision}]" if n_vision else ""
+        flag += f" ({n_entities} entities, {len(all_raw_deals)} deals — staged, not yet linked)"
+        flag += " [⚠ NEEDS REVIEW]" if validation_warning else ""
+        return f"DRAFT {source}{flag} [draft_id={draft_id}]"
+
+    # commit=True: write everything live now that extraction/resolution/deal
+    # extraction are all done.
+    entry_id = db.upsert_document(**common_fields)
+
     db_chunks = [db.Chunk(c.chunk_num, c.chunk_type, c.text) for c in result.chunks]
     db.store_chunks(entry_id, db_chunks)
-
-    # Update FTS index
     db.index_entry(entry_id)
 
-    # Resolve and link entities (primary/secondary roles from LLM)
-    try:
-        resolved = await resolve_entities_async(meta, source=source)
-        n_entities = 0
-        for r in resolved:
-            canonical = r.get("canonical", "").strip()
-            if canonical:
-                eid = db.find_or_create_entity(
-                    canonical,
-                    r.get("type", "other"),
-                    proposed=bool(r.get("is_new", False)),
-                )
-                db.link_entry_to_entity(entry_id, eid, role=r.get("role", "secondary"))
-                n_entities += 1
-    except Exception as e:
-        log.warning("Entity resolution failed for %s: %s", source, e)
-        resolved = []
-        n_entities = 0
+    n_entities_written = 0
+    for r in resolved:
+        canonical = r.get("canonical", "").strip()
+        if canonical:
+            eid = db.find_or_create_entity(
+                canonical, r.get("type", "other"), proposed=bool(r.get("is_new", False)),
+            )
+            db.link_entry_to_entity(entry_id, eid, role=r.get("role", "secondary"))
+            n_entities_written += 1
 
-    # Extract and store structured deals — per chunk, not the truncated
-    # whole-document `txt`. `txt` is capped at MAX_CHARS_PER_DOC and shares
-    # that budget proportionally across every chunk (see full_text()), so a
-    # slide's "Media rights deals" section — which tends to come after
-    # Overview/Audience — is often cut off before the model ever sees it.
-    # Running per-chunk on the full untruncated text closes that gap, at the
-    # cost of one extraction call per page/slide instead of one per document.
-    # Concurrency is capped (DEAL_EXTRACT_CONCURRENCY) rather than firing every
-    # chunk at once — with e.g. 13 chunks, unbounded concurrency has been
-    # observed to overload the claude-CLI fallback badly enough that calls
-    # which would otherwise succeed time out purely from the contention.
     n_deals = 0
-    try:
-        canonical_names = [
-            r.get("canonical", "").strip()
-            for r in resolved
-            if r.get("canonical", "").strip()
-        ]
-        if canonical_names:
-            sem = asyncio.Semaphore(DEAL_EXTRACT_CONCURRENCY)
-
-            async def _extract_chunk_deals(c):
-                async with sem:
-                    hint = f"{source} — {c.chunk_type} {c.chunk_num}"
-                    return await extract_deals_async(c.text, canonical_names, source_hint=hint)
-
-            per_chunk_deals = await asyncio.gather(*[_extract_chunk_deals(c) for c in result.chunks])
-            entry_rel = meta.get("reliability", "reported")
-            for raw_deals in per_chunk_deals:
-                for d in raw_deals:
-                    en = (d.get("entity_name") or "").strip()
-                    entity_row = db.find_entity_by_name_or_alias(en)
-                    if entity_row:
-                        confidence  = d.get("confidence", "medium")
-                        deal_status = "unverified" if confidence == "low" else "current"
-                        db.add_deal(
-                            entity_id       = entity_row["id"],
-                            territory       = d.get("territory", ""),
-                            broadcaster     = d.get("broadcaster", ""),
-                            rights_holder   = d.get("rights_holder", ""),
-                            value           = d.get("value"),
-                            currency        = d.get("currency", ""),
-                            value_note      = d.get("value_note", ""),
-                            period_start    = d.get("period_start", ""),
-                            period_end      = d.get("period_end", ""),
-                            platform        = d.get("platform", ""),
-                            source_entry_id = entry_id,
-                            source_note     = source,
-                            status          = deal_status,
-                            reliability     = entry_rel,
-                        )
-                        n_deals += 1
-    except Exception as e:
-        log.warning("Deal extraction failed for %s: %s", source, e)
+    entry_rel = meta.get("reliability", "reported")
+    for d in all_raw_deals:
+        en = (d.get("entity_name") or "").strip()
+        entity_row = db.find_entity_by_name_or_alias(en)
+        if entity_row:
+            confidence  = d.get("confidence", "medium")
+            deal_status = "unverified" if confidence == "low" else "current"
+            db.add_deal(
+                entity_id       = entity_row["id"],
+                territory       = d.get("territory", ""),
+                broadcaster     = d.get("broadcaster", ""),
+                rights_holder   = d.get("rights_holder", ""),
+                value           = d.get("value"),
+                currency        = d.get("currency", ""),
+                value_note      = d.get("value_note", ""),
+                period_start    = d.get("period_start", ""),
+                period_end      = d.get("period_end", ""),
+                platform        = d.get("platform", ""),
+                source_entry_id = entry_id,
+                source_note     = source,
+                status          = deal_status,
+                reliability     = entry_rel,
+            )
+            n_deals += 1
 
     # Post-ingest validation: advisory only, never blocks — see docstring.
     warning = _compute_validation_warning(
-        [c.text for c in result.chunks], path.stat().st_size, n_entities,
+        [c.text for c in result.chunks], path.stat().st_size, n_entities_written,
     )
     db.set_validation_warning(entry_id, warning)
 
     flag = " [possible duplicate]" if is_dup else ""
     flag += " [OCR]" if result.ocr_used else ""
-    n_vision = sum(1 for c in result.chunks if "[Vision-extracted]" in c.text)
     flag += f" [vision:{n_vision}]" if n_vision else ""
-    flag += f" ({n_entities} entities, {n_deals} deals)"
+    flag += f" ({n_entities_written} entities, {n_deals} deals)"
     flag += " [⚠ NEEDS REVIEW]" if warning else ""
     return f"OK    {source}{flag}"
 
@@ -671,8 +721,10 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
 async def ingest_all_async(
     paths: list[Path],
     batch_size: int = INGEST_BATCH_SIZE,
+    commit: bool = True,
 ) -> list[str]:
-    """Process `paths` in parallel batches of `batch_size`."""
+    """Process `paths` in parallel batches of `batch_size`. commit=False stages
+    every file as a draft instead of writing it live — see ingest_file_async."""
     db.init_db()
     existing_sources = [e["source"] for e in db.get_all_entries()]
     sem = asyncio.Semaphore(batch_size)
@@ -680,7 +732,7 @@ async def ingest_all_async(
     async def run_one(p: Path) -> str:
         async with sem:
             try:
-                return await ingest_file_async(p, existing_sources)
+                return await ingest_file_async(p, existing_sources, commit=commit)
             except Exception as e:
                 log.error("Unhandled error for %s: %s", p.name, e)
                 return f"FAIL  {p.name}: {e}"
