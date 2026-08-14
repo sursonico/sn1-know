@@ -949,14 +949,20 @@ def resolve_entities(metadata: dict, max_attempts: int = _ENTITY_MAX_ATTEMPTS) -
     Given classification metadata dict, return resolved entity list.
     Each item: {"canonical": str, "type": str, "is_new": bool}
 
-    Retries up to max_attempts times on a failed call or an unparseable response —
-    this call runs over the same claude-CLI subprocess fallback used everywhere else
-    without an API key, which we've observed intermittently timing out or returning
-    conversational commentary instead of the requested JSON array. Without a retry,
-    one bad response silently produces zero entity links for the document even
-    though the tags it was given (from a separate, successful classification call)
-    clearly named the entities — see kb/ingest.py's validation-warning banner, which
-    is what surfaces exactly this failure mode.
+    Retries up to max_attempts times on a failed call, an unparseable response,
+    OR a response that parses cleanly but comes back as an empty list — this call
+    has proven unreliable in more than one way: over the claude-CLI subprocess
+    fallback (no API key) it intermittently times out or returns conversational
+    commentary instead of JSON, but we've also seen it return a *valid, clean []*
+    on one attempt and a properly populated list on the very next attempt for the
+    identical input — the model second-guessing whether a broad, multi-topic tag
+    string is "substantively about" anything. A first-attempt [] therefore isn't
+    trustworthy enough to accept as final; only the *last* attempt's result
+    (empty or not) is returned unconditionally, so this still can't hang or block
+    ingestion. Every non-success branch logs the raw response so this is visible
+    in production logs instead of silently producing zero entity links for a
+    document whose tags (from a separate, successful classification call) clearly
+    named the entities.
     """
     text = _entity_metadata_text(metadata)
     if not text.strip():
@@ -968,13 +974,28 @@ def resolve_entities(metadata: dict, max_attempts: int = _ENTITY_MAX_ATTEMPTS) -
             log.warning("resolve_entities: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
             continue
         result = _parse_entity_list(raw)
-        if result is not None:
-            return result
-        log.warning(
-            "resolve_entities: JSON parse failed (attempt %d/%d) — raw response: %r",
-            attempt, max_attempts, raw[:300],
-        )
-    log.warning("resolve_entities: all %d attempts failed — returning no entities", max_attempts)
+        if result is None:
+            log.warning(
+                "resolve_entities: JSON parse failed (attempt %d/%d) — raw response: %r",
+                attempt, max_attempts, raw[:300],
+            )
+            continue
+        if not result and attempt < max_attempts:
+            log.warning(
+                "resolve_entities: attempt %d/%d parsed cleanly but returned an empty list for "
+                "non-empty metadata (%r) — retrying rather than trusting an early empty result. "
+                "Raw response: %r",
+                attempt, max_attempts, text[:200], raw[:300],
+            )
+            continue
+        if not result:
+            log.warning(
+                "resolve_entities: final attempt (%d/%d) also came back empty — accepting [] as "
+                "the result. Raw response: %r",
+                attempt, max_attempts, raw[:300],
+            )
+        return result
+    log.warning("resolve_entities: all %d attempts failed (call error or unparseable) — returning no entities", max_attempts)
     return []
 
 
@@ -990,13 +1011,28 @@ async def resolve_entities_async(metadata: dict, max_attempts: int = _ENTITY_MAX
             log.warning("resolve_entities_async: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
             continue
         result = _parse_entity_list(raw)
-        if result is not None:
-            return result
-        log.warning(
-            "resolve_entities_async: JSON parse failed (attempt %d/%d) — raw response: %r",
-            attempt, max_attempts, raw[:300],
-        )
-    log.warning("resolve_entities_async: all %d attempts failed — returning no entities", max_attempts)
+        if result is None:
+            log.warning(
+                "resolve_entities_async: JSON parse failed (attempt %d/%d) — raw response: %r",
+                attempt, max_attempts, raw[:300],
+            )
+            continue
+        if not result and attempt < max_attempts:
+            log.warning(
+                "resolve_entities_async: attempt %d/%d parsed cleanly but returned an empty list "
+                "for non-empty metadata (%r) — retrying rather than trusting an early empty "
+                "result. Raw response: %r",
+                attempt, max_attempts, text[:200], raw[:300],
+            )
+            continue
+        if not result:
+            log.warning(
+                "resolve_entities_async: final attempt (%d/%d) also came back empty — accepting "
+                "[] as the result. Raw response: %r",
+                attempt, max_attempts, raw[:300],
+            )
+        return result
+    log.warning("resolve_entities_async: all %d attempts failed (call error or unparseable) — returning no entities", max_attempts)
     return []
 
 
