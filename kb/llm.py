@@ -898,9 +898,17 @@ async def extract_deals_async(
 
 _ENTITY_SYSTEM = textwrap.dedent("""
     You are a sports-media-rights intelligence analyst building a knowledge base.
-    Given metadata extracted from a document or note, identify only the entities the
-    document is SUBSTANTIVELY ABOUT — primary subjects and genuinely significant
-    secondary ones. Do NOT include every passing mention.
+    You will be given the filename, summary and classification tags an automated
+    pipeline already extracted for ONE real, specific document or note that is
+    being ingested right now. This is genuine per-document output, not a sample
+    taxonomy or reference list, even when the tags are broad (a multi-property
+    overview deck covering many leagues/broadcasters/markets is a completely
+    normal, real input) — always attempt the task rather than declining because
+    the tag list looks exhaustive.
+
+    Identify only the entities the document is SUBSTANTIVELY ABOUT — primary
+    subjects and genuinely significant secondary ones. Do NOT include every
+    passing mention.
 
     Return a JSON array where each element has:
       "canonical"  — standard full name (e.g. "UEFA Champions League", never "UCL")
@@ -926,13 +934,29 @@ _ENTITY_SYSTEM = textwrap.dedent("""
 _ENTITY_MAX_ATTEMPTS = 3  # this call is markedly flaky over the claude-CLI fallback — see resolve_entities_async docstring
 
 
-def _entity_metadata_text(metadata: dict) -> str:
-    return " | ".join(filter(None, [
+def _entity_metadata_text(metadata: dict, source: str = "") -> str:
+    """
+    Build the entity-resolution prompt input, grounded with the filename and
+    summary (when available) rather than a bare tag string. In testing, the
+    claude-CLI fallback has sometimes recognized an unadorned tag list as
+    resembling this project's own seed taxonomy and refused to treat it as
+    real per-document output — grounding it as "the extracted metadata for
+    file X" measurably reduces that failure mode.
+    """
+    tags = " | ".join(filter(None, [
         metadata.get("sports_leagues", ""),
         metadata.get("org_tags", ""),
         metadata.get("market_tags", ""),
         metadata.get("topic_tags", ""),
     ]))
+    if not tags.strip():
+        return ""
+    lines = [f"Document: {source}"] if source else []
+    summary = (metadata.get("summary") or "").strip()
+    if summary:
+        lines.append(f"Summary: {summary}")
+    lines.append(f"Tags: {tags}")
+    return "\n".join(lines)
 
 
 def _parse_entity_list(raw: str) -> Optional[list[dict]]:
@@ -944,32 +968,36 @@ def _parse_entity_list(raw: str) -> Optional[list[dict]]:
     return result if isinstance(result, list) else None
 
 
-def resolve_entities(metadata: dict, max_attempts: int = _ENTITY_MAX_ATTEMPTS) -> list[dict]:
+def resolve_entities(metadata: dict, source: str = "", max_attempts: int = _ENTITY_MAX_ATTEMPTS) -> list[dict]:
     """
     Given classification metadata dict, return resolved entity list.
     Each item: {"canonical": str, "type": str, "is_new": bool}
 
+    `source` (the filename, when ingesting a document) is passed through to
+    ground the prompt as real per-document output — see _entity_metadata_text.
+
     Retries up to max_attempts times on a failed call, an unparseable response,
     OR a response that parses cleanly but comes back as an empty list — this call
     has proven unreliable in more than one way: over the claude-CLI subprocess
-    fallback (no API key) it intermittently times out or returns conversational
-    commentary instead of JSON, but we've also seen it return a *valid, clean []*
-    on one attempt and a properly populated list on the very next attempt for the
-    identical input — the model second-guessing whether a broad, multi-topic tag
-    string is "substantively about" anything. A first-attempt [] therefore isn't
-    trustworthy enough to accept as final; only the *last* attempt's result
-    (empty or not) is returned unconditionally, so this still can't hang or block
-    ingestion. Every non-success branch logs the raw response so this is visible
-    in production logs instead of silently producing zero entity links for a
-    document whose tags (from a separate, successful classification call) clearly
-    named the entities.
+    fallback (no API key) it intermittently times out, returns conversational
+    commentary instead of JSON (we've seen it decline outright, reasoning that a
+    broad tag list "looks like the full taxonomy" rather than one document's
+    output), or occasionally returns a *valid, clean []* on one attempt and a
+    properly populated list on the very next attempt for the identical input. A
+    first-attempt failure or [] therefore isn't trustworthy enough to accept as
+    final; only the *last* attempt's result (empty or not) is returned
+    unconditionally, so this still can't hang or block ingestion. Every
+    non-success branch logs the raw response so this is visible in production
+    logs instead of silently producing zero entity links for a document whose
+    tags (from a separate, successful classification call) clearly named the
+    entities.
     """
-    text = _entity_metadata_text(metadata)
-    if not text.strip():
+    text = _entity_metadata_text(metadata, source)
+    if not text:
         return []
     for attempt in range(1, max_attempts + 1):
         try:
-            raw = call_claude(_ENTITY_SYSTEM, f"Metadata: {text}", model=CLASSIFY_MODEL, max_tokens=600)
+            raw = call_claude(_ENTITY_SYSTEM, text, model=CLASSIFY_MODEL, max_tokens=600)
         except Exception as e:
             log.warning("resolve_entities: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
             continue
@@ -999,14 +1027,14 @@ def resolve_entities(metadata: dict, max_attempts: int = _ENTITY_MAX_ATTEMPTS) -
     return []
 
 
-async def resolve_entities_async(metadata: dict, max_attempts: int = _ENTITY_MAX_ATTEMPTS) -> list[dict]:
+async def resolve_entities_async(metadata: dict, source: str = "", max_attempts: int = _ENTITY_MAX_ATTEMPTS) -> list[dict]:
     """Async counterpart of resolve_entities() — see its docstring for the retry rationale."""
-    text = _entity_metadata_text(metadata)
-    if not text.strip():
+    text = _entity_metadata_text(metadata, source)
+    if not text:
         return []
     for attempt in range(1, max_attempts + 1):
         try:
-            raw = await call_claude_async(_ENTITY_SYSTEM, f"Metadata: {text}", model=CLASSIFY_MODEL, max_tokens=600)
+            raw = await call_claude_async(_ENTITY_SYSTEM, text, model=CLASSIFY_MODEL, max_tokens=600)
         except Exception as e:
             log.warning("resolve_entities_async: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
             continue

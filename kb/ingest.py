@@ -574,7 +574,7 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
 
     # Resolve and link entities (primary/secondary roles from LLM)
     try:
-        resolved = await resolve_entities_async(meta)
+        resolved = await resolve_entities_async(meta, source=source)
         n_entities = 0
         for r in resolved:
             canonical = r.get("canonical", "").strip()

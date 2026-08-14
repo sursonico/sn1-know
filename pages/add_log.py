@@ -271,8 +271,8 @@ with tab_log:
     # Returns (entity_id_list, existing_entries, conflict_result).
     # ─────────────────────────────────────────────────────────────────────────
     def _run_conflict_check(summary: str, detail: str, org: str, market: str, sport: str, topic: str, source_hint: str = "", raw_text: str = ""):
-        meta = {"sports_leagues": sport, "org_tags": org, "market_tags": market, "topic_tags": topic}
-        resolved = resolve_entities(meta)
+        meta = {"sports_leagues": sport, "org_tags": org, "market_tags": market, "topic_tags": topic, "summary": summary}
+        resolved = resolve_entities(meta, source=source_hint)
         entity_ids = []
         for r in resolved:
             if r.get("canonical"):
