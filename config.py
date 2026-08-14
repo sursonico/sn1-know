@@ -22,6 +22,11 @@ ANSWER_MODEL    = os.getenv("SN1_ANSWER_MODEL",     "claude-sonnet-4-6")
 
 # ── Ingestion ───────────────────────────────────────────────────────────────
 INGEST_BATCH_SIZE  = int(os.getenv("SN1_BATCH_SIZE",  "6"))
+# Per-document concurrency for per-chunk deal extraction. Kept low: firing one
+# LLM call per page/slide at once (e.g. 13 for a 13-slide deck) on top of
+# cross-file concurrency has been observed to overload the claude-CLI fallback
+# badly enough that otherwise-fine calls time out under the contention alone.
+DEAL_EXTRACT_CONCURRENCY = int(os.getenv("SN1_DEAL_EXTRACT_CONCURRENCY", "3"))
 MAX_CHARS_PER_DOC  = int(os.getenv("SN1_MAX_CHARS",   "15000"))
 MAX_CHARS_PER_CHUNK = int(os.getenv("SN1_MAX_CHARS_PER_CHUNK", "12000"))  # chars stored per page/slide
 OCR_CHAR_THRESHOLD    = 80      # chars/page below which OCR is attempted

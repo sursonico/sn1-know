@@ -2,6 +2,7 @@
 import asyncio
 from datetime import date
 from pathlib import Path
+from typing import Optional
 import streamlit as st
 from kb.ui import page_setup, section_title, reliability_badge_html, ENTITY_TYPE_META
 from kb.db import (
@@ -9,7 +10,7 @@ from kb.db import (
     update_enrichment, init_db,
     find_or_create_entity, link_entry_to_entity,
     get_recent_entries_for_entities, mark_entry_superseded,
-    add_deal, update_deal, get_deals_for_entity, find_entity_by_name_or_alias,
+    add_deal, update_deal, delete_deal, get_deals_for_entity, find_entity_by_name_or_alias,
     get_entities_for_entry, get_chunks_for_entries, get_all_entries,
     get_all_entities, update_chunk_text, set_validation_warning,
 )
@@ -59,88 +60,117 @@ _DEAL_STATUSES = ["current", "unverified"]
 _DEAL_RELIABILITY = ["confirmed", "reported", "rumoured"]
 
 
+def _render_deal_row_form(deal: Optional[dict], entity_id: int, entry: dict, key: str) -> None:
+    """Inline add/edit form for one deal row. `deal` is None for a fresh add."""
+    editing = deal is not None
+    d = deal or {}
+    with st.form(f"{key}_form_{d.get('id','new')}"):
+        fa1, fa2 = st.columns(2)
+        d_territory   = fa1.text_input("Territory *",   value=d.get("territory", ""))
+        d_broadcaster = fa2.text_input("Broadcaster *", value=d.get("broadcaster", ""))
+        fb1, fb2 = st.columns(2)
+        d_rights_holder = fb1.text_input("Rights holder", value=d.get("rights_holder", ""))
+        d_platform      = fb2.text_input("Platform",      value=d.get("platform", ""))
+        fc1, fc2, fc3 = st.columns(3)
+        d_value = fc1.number_input("Value (millions)", min_value=0.0, value=float(d.get("value") or 0.0), step=0.1, format="%.2f")
+        cur_default = d.get("currency", "")
+        d_currency = fc2.selectbox("Currency", _DEAL_CURRENCIES, index=_DEAL_CURRENCIES.index(cur_default) if cur_default in _DEAL_CURRENCIES else 0)
+        d_value_note = fc3.text_input("Qualifier", value=d.get("value_note", ""))
+        fd1, fd2 = st.columns(2)
+        d_period_start = fd1.text_input("Period start", value=d.get("period_start", ""))
+        d_period_end   = fd2.text_input("Period end",   value=d.get("period_end", ""))
+        st_default  = d.get("status", "current")
+        rel_default = d.get("reliability", "reported")
+        fe1, fe2 = st.columns(2)
+        d_status      = fe1.selectbox("Status",      _DEAL_STATUSES,    index=_DEAL_STATUSES.index(st_default) if st_default in _DEAL_STATUSES else 0)
+        d_reliability = fe2.selectbox("Reliability", _DEAL_RELIABILITY, index=_DEAL_RELIABILITY.index(rel_default) if rel_default in _DEAL_RELIABILITY else 1)
+        c1, c2 = st.columns(2)
+        submitted = c1.form_submit_button("Update" if editing else "Save", type="primary")
+        cancelled = c2.form_submit_button("Cancel")
+
+    if cancelled:
+        st.session_state.pop(f"{key}_editing", None)
+        st.session_state.pop(f"{key}_adding", None)
+        st.rerun()
+
+    if submitted:
+        if not d_territory.strip() or not d_broadcaster.strip():
+            st.error("Territory and Broadcaster are required.")
+            return
+        fields = dict(
+            territory=d_territory.strip(), broadcaster=d_broadcaster.strip(),
+            rights_holder=d_rights_holder.strip(), platform=d_platform.strip(),
+            value=(d_value if d_value > 0 else None),
+            currency=(d_currency if d_currency != "Other" else ""),
+            value_note=d_value_note.strip(),
+            period_start=d_period_start.strip(), period_end=d_period_end.strip(),
+            status=d_status, reliability=d_reliability,
+        )
+        if editing:
+            update_deal(d["id"], **fields)
+        else:
+            add_deal(
+                entity_id=entity_id, source_entry_id=entry["id"],
+                source_note=entry.get("source", ""), **fields,
+            )
+        st.session_state.pop(f"{key}_editing", None)
+        st.session_state.pop(f"{key}_adding", None)
+        st.rerun()
+
+
 def _render_deal_editor(entity_row: dict, entry: dict, cid: int) -> None:
     """
-    Structured deal entry/correction for one entity, scoped to one page — this
-    is the write that actually populates the entity hub's rights table
-    (kb.db.get_deals_for_entity / the `deals` table). Entity tagging alone
-    (link_entry_to_entity) never touches this table, which is why this is a
-    separate control rather than something "Save corrections" infers.
-
-    Uses the same fields and add_deal()/update_deal() calls as the "Add a deal
-    manually" form on the entity hub page (pages/entity.py), but also stamps
-    source_entry_id/source_note to this document since we know exactly where
-    the terms came from.
+    Structured deal display/correction for one entity, scoped to one page —
+    this is the write that actually populates the entity hub's rights table
+    (kb.db.get_deals_for_entity / the `deals` table); entity tagging alone
+    (link_entry_to_entity) never touches it. Rows here are populated
+    automatically by _save_page_corrections() extracting this page's deal
+    terms when the entity tag is saved — this control is for reviewing what
+    was written (inline edit/delete per row), not for typing deals in from
+    scratch. "Add a deal manually" stays, but as the fallback for gaps
+    extraction missed, not the primary path.
     """
     entity_id = entity_row["id"]
     entity_name = entity_row["canonical_name"]
     key = f"deal_{cid}_{entity_id}"
 
     st.markdown(f"**Deal terms — {entity_name}**")
-    existing = get_deals_for_entity(entity_id, include_superseded=False)
-    if existing:
-        for d in existing:
-            bits = [d.get("territory") or "?", d.get("broadcaster") or "?"]
-            if d.get("value"):
-                bits.append(f"{d.get('currency','')} {d['value']}m{(' ' + d['value_note']) if d.get('value_note') else ''}")
-            period = "–".join(p for p in [d.get("period_start"), d.get("period_end")] if p)
-            if period:
-                bits.append(period)
-            st.caption(f"#{d['id']} · " + "  ·  ".join(str(b) for b in bits if b))
-    else:
-        st.caption("_No deal rows for this entity yet — the rights table on its hub page is empty._")
+    existing = get_deals_for_entity(entity_id, include_superseded=True)
+    editing_id = st.session_state.get(f"{key}_editing")
 
-    edit_opts = {"➕ Add new deal": None}
+    if not existing:
+        st.caption(
+            "_No deal rows for this entity yet. Extraction runs automatically "
+            "against this page's text when you click Save corrections below — "
+            "if it still comes up empty, use \"Add a deal manually\"._"
+        )
     for d in existing:
-        edit_opts[f"✏ Edit #{d['id']} — {d.get('territory','?')} / {d.get('broadcaster','?')}"] = d
-    choice = st.selectbox("Add or edit", list(edit_opts.keys()), key=f"{key}_choice")
-    editing = edit_opts[choice]
+        if editing_id == d["id"]:
+            _render_deal_row_form(d, entity_id, entry, key)
+            continue
+        bits = [d.get("territory") or "?", d.get("broadcaster") or "?"]
+        if d.get("value"):
+            bits.append(f"{d.get('currency','')} {d['value']}m{(' ' + d['value_note']) if d.get('value_note') else ''}")
+        period = "–".join(p for p in [d.get("period_start"), d.get("period_end")] if p)
+        if period:
+            bits.append(period)
+        status_tag = f"  ·  [{d['status']}]" if d.get("status") != "current" else ""
+        flag = f"  ·  ⚠ {d['flagged_for_review']}" if d.get("flagged_for_review") else ""
 
-    with st.form(f"{key}_form_{choice}"):
-        fa1, fa2 = st.columns(2)
-        d_territory   = fa1.text_input("Territory *",   value=(editing or {}).get("territory", ""))
-        d_broadcaster = fa2.text_input("Broadcaster *", value=(editing or {}).get("broadcaster", ""))
-        fb1, fb2 = st.columns(2)
-        d_rights_holder = fb1.text_input("Rights holder", value=(editing or {}).get("rights_holder", ""))
-        d_platform      = fb2.text_input("Platform",      value=(editing or {}).get("platform", ""))
-        fc1, fc2, fc3 = st.columns(3)
-        d_value = fc1.number_input("Value (millions)", min_value=0.0, value=float((editing or {}).get("value") or 0.0), step=0.1, format="%.2f")
-        cur_default = (editing or {}).get("currency", "")
-        d_currency = fc2.selectbox("Currency", _DEAL_CURRENCIES, index=_DEAL_CURRENCIES.index(cur_default) if cur_default in _DEAL_CURRENCIES else 0)
-        d_value_note = fc3.text_input("Qualifier", value=(editing or {}).get("value_note", ""))
-        fd1, fd2 = st.columns(2)
-        d_period_start = fd1.text_input("Period start", value=(editing or {}).get("period_start", ""))
-        d_period_end   = fd2.text_input("Period end",   value=(editing or {}).get("period_end", ""))
-        st_default  = (editing or {}).get("status", "current")
-        rel_default = (editing or {}).get("reliability", "reported")
-        fe1, fe2 = st.columns(2)
-        d_status      = fe1.selectbox("Status",      _DEAL_STATUSES,    index=_DEAL_STATUSES.index(st_default) if st_default in _DEAL_STATUSES else 0)
-        d_reliability = fe2.selectbox("Reliability", _DEAL_RELIABILITY, index=_DEAL_RELIABILITY.index(rel_default) if rel_default in _DEAL_RELIABILITY else 1)
-        submitted = st.form_submit_button("Update deal" if editing else "Save deal", type="primary")
-
-    if submitted:
-        if not d_territory.strip() or not d_broadcaster.strip():
-            st.error("Territory and Broadcaster are required.")
-        else:
-            fields = dict(
-                territory=d_territory.strip(), broadcaster=d_broadcaster.strip(),
-                rights_holder=d_rights_holder.strip(), platform=d_platform.strip(),
-                value=(d_value if d_value > 0 else None),
-                currency=(d_currency if d_currency != "Other" else ""),
-                value_note=d_value_note.strip(),
-                period_start=d_period_start.strip(), period_end=d_period_end.strip(),
-                status=d_status, reliability=d_reliability,
-            )
-            if editing:
-                update_deal(editing["id"], **fields)
-                st.success(f"Updated deal #{editing['id']} for {entity_name}.")
-            else:
-                new_id = add_deal(
-                    entity_id=entity_id, source_entry_id=entry["id"],
-                    source_note=entry.get("source", ""), **fields,
-                )
-                st.success(f"Saved deal #{new_id} for {entity_name}.")
+        row_c, edit_c, del_c = st.columns([7, 1, 1])
+        row_c.caption(f"#{d['id']} · " + "  ·  ".join(str(b) for b in bits if b) + status_tag + flag)
+        if edit_c.button("✏", key=f"{key}_editbtn_{d['id']}", help="Edit this deal"):
+            st.session_state[f"{key}_editing"] = d["id"]
             st.rerun()
+        if del_c.button("🗑", key=f"{key}_delbtn_{d['id']}", help="Delete (soft — recoverable in the DB)"):
+            delete_deal(d["id"])
+            st.rerun()
+
+    if st.session_state.get(f"{key}_adding"):
+        _render_deal_row_form(None, entity_id, entry, key)
+    elif st.button("➕ Add a deal manually", key=f"{key}_addbtn"):
+        st.session_state[f"{key}_adding"] = True
+        st.rerun()
 
 
 def _render_page_editor(entry: dict, chunk: dict, src_path) -> None:
@@ -214,12 +244,20 @@ def _render_page_editor(entry: dict, chunk: dict, src_path) -> None:
                 )
 
 
-def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int]:
+def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int, int]:
     """
     Apply every pgtxt_/pgent_ widget value for this entry's chunks: update
-    changed chunk text, link any newly-tagged entities, re-index, and
-    recompute the validation banner from the corrected data. Returns
-    (n_text_edits, n_entities_added).
+    changed chunk text, link any newly-tagged entities, auto-extract and write
+    deal terms for each page's tagged entities, re-index, and recompute the
+    validation banner from the corrected data. Returns
+    (n_text_edits, n_entities_added, n_deals_written).
+
+    Deal extraction runs against every page that has a tagged entity, every
+    time this is clicked — not just newly-tagged ones — because add_deal()'s
+    dedup-and-fill logic makes a repeat run harmless (it updates gaps on the
+    existing row rather than duplicating), and confirming an entity tag is
+    exactly the "entity resolved" moment that should write deal terms
+    immediately rather than leaving a blank form as the only path.
     """
     eid = entry["id"]
     n_text_edits = 0
@@ -246,6 +284,43 @@ def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int]:
         link_entry_to_entity(eid, entity_id, role="primary")
         n_entities_added += 1
 
+    entry_rel = entry.get("reliability", "reported") or "reported"
+    n_deals_written = 0
+    for chunk in chunks:
+        cid = chunk["id"]
+        page_names = [n.strip() for n in (st.session_state.get(f"pgent_{cid}", []) or []) if n.strip()]
+        if not page_names:
+            continue
+        page_text = st.session_state.get(f"pgtxt_{cid}", chunk.get("text") or "")
+        if not page_text.strip():
+            continue
+        try:
+            raw_deals = extract_deals(
+                page_text, page_names,
+                source_hint=f"{entry.get('source','')} — {chunk.get('chunk_type','page')} {chunk.get('chunk_num','')}",
+            )
+        except Exception:
+            raw_deals = []
+        for d in raw_deals:
+            en = (d.get("entity_name") or "").strip()
+            if en not in page_names:
+                continue
+            entity_row = find_entity_by_name_or_alias(en)
+            if not entity_row:
+                continue
+            confidence  = d.get("confidence", "medium")
+            deal_status = "unverified" if confidence == "low" else "current"
+            add_deal(
+                entity_id=entity_row["id"], territory=d.get("territory", ""),
+                broadcaster=d.get("broadcaster", ""), rights_holder=d.get("rights_holder", ""),
+                value=d.get("value"), currency=d.get("currency", ""),
+                value_note=d.get("value_note", ""), period_start=d.get("period_start", ""),
+                period_end=d.get("period_end", ""), platform=d.get("platform", ""),
+                source_entry_id=eid, source_note=entry.get("source", ""),
+                status=deal_status, reliability=entry_rel,
+            )
+            n_deals_written += 1
+
     index_entry(eid)
 
     fresh_chunks = get_chunks_for_entries([eid]).get(eid, [])
@@ -262,7 +337,7 @@ def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int]:
     )
     set_validation_warning(eid, warning)
 
-    return n_text_edits, n_entities_added
+    return n_text_edits, n_entities_added, n_deals_written
 
 
 def _render_review_card(entry: dict) -> None:
@@ -351,16 +426,18 @@ def _render_review_card(entry: dict) -> None:
             _render_page_editor(entry, chunk, src_path)
 
         if st.button("💾 Save corrections", type="primary", key=f"save_corrections_{eid}"):
-            n_edits, n_added = _save_page_corrections(entry, chunks)
-            st.session_state[f"corrections_saved_{eid}"] = (n_edits, n_added)
+            with st.spinner("Saving corrections and extracting deal terms for tagged pages…"):
+                n_edits, n_added, n_deals = _save_page_corrections(entry, chunks)
+            st.session_state[f"corrections_saved_{eid}"] = (n_edits, n_added, n_deals)
             st.rerun()
 
         saved = st.session_state.pop(f"corrections_saved_{eid}", None)
         if saved:
-            n_edits, n_added = saved
+            n_edits, n_added, n_deals = saved
             st.success(
                 f"Saved — {n_edits} page{'s' if n_edits != 1 else ''} text-corrected, "
-                f"{n_added} entity link{'s' if n_added != 1 else ''} applied. Re-indexed "
+                f"{n_added} entity link{'s' if n_added != 1 else ''} applied, "
+                f"{n_deals} deal row{'s' if n_deals != 1 else ''} written/updated. Re-indexed "
                 f"for Ask, and the validation check has re-run (see the badge above)."
             )
 

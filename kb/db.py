@@ -18,9 +18,11 @@ Soft deletion:
   `deleted_with_entry`, which is what `restore_entry()` uses to put them back.
 """
 
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -118,6 +120,7 @@ CREATE TABLE IF NOT EXISTS deals (
     source_note     TEXT    DEFAULT '',
     status          TEXT    DEFAULT 'current',
     superseded_by   INTEGER REFERENCES deals(id),
+    flagged_for_review TEXT DEFAULT '',
     deleted_at      TEXT,
     deleted_with_entry INTEGER,
     date_added      TEXT    DEFAULT (datetime('now')),
@@ -194,6 +197,10 @@ def init_db(path: Path = DB_PATH) -> None:
         # Live migration: post-ingest validation flag on entries
         if "validation_warning" not in e_cols:
             con.execute("ALTER TABLE entries ADD COLUMN validation_warning TEXT DEFAULT ''")
+        # Live migration: flag column for deals that need manual review (e.g. a
+        # value with no currency)
+        if "flagged_for_review" not in d_cols:
+            con.execute("ALTER TABLE deals ADD COLUMN flagged_for_review TEXT DEFAULT ''")
 
 
 # ── Entry reads ─────────────────────────────────────────────────────────────
@@ -809,6 +816,66 @@ def get_proposed_entities(path: Path = DB_PATH) -> list[dict]:
 
 # ── Deals CRUD ────────────────────────────────────────────────────────────────
 
+def _normalize_deal_party(name: str, path: Path = DB_PATH) -> str:
+    """
+    Resolve a raw broadcaster/territory string to its canonical entity name
+    via exact canonical-name-or-alias match (case-insensitive), so "Sky",
+    "Sky UK" and "Sky Sports" all collapse to one name instead of creating
+    three separate deal rows. Returns the trimmed input unchanged when no
+    entity matches — not every broadcaster/territory needs to be seeded.
+    """
+    name = (name or "").strip()
+    if not name:
+        return name
+    row = find_entity_by_name_or_alias(name, path=path)
+    return row["canonical_name"] if row else name
+
+
+_FULL_YEAR_RE = re.compile(r"(\d{4})")
+_SPLIT_YEAR_RE = re.compile(r"(\d{2})\s*/\s*(\d{2})\b")
+
+
+def _infer_deal_end_year(period_end: str) -> Optional[int]:
+    """
+    Best-effort year extraction from messy free-text period_end values like
+    '2028', '2027/28', '27/28', '30/06/2028'. Returns None when nothing
+    extractable — callers must leave status untouched in that case rather
+    than guess.
+    """
+    s = (period_end or "").strip()
+    if not s:
+        return None
+    m = _SPLIT_YEAR_RE.search(s)
+    if m:
+        yy = max(int(m.group(1)), int(m.group(2)))
+        return 2000 + yy
+    years = _FULL_YEAR_RE.findall(s)
+    if years:
+        return max(int(y) for y in years)
+    return None
+
+
+def _infer_deal_status(period_end: str, requested_status: str) -> str:
+    """
+    A deal whose period has clearly already ended is 'superseded' regardless
+    of what was requested — that's a factual/temporal state, not a judgment
+    call. Otherwise the requested status (e.g. 'current'/'unverified' from
+    extraction confidence) is left as-is. Explicit 'superseded' always wins.
+    """
+    if requested_status == "superseded":
+        return requested_status
+    end_year = _infer_deal_end_year(period_end)
+    if end_year is not None and end_year < date.today().year:
+        return "superseded"
+    return requested_status
+
+
+_DEAL_FILLABLE_FIELDS = [
+    "rights_holder", "value", "currency", "value_note", "platform",
+    "source_entry_id", "source_note", "flagged_for_review",
+]
+
+
 def add_deal(
     entity_id: int,
     territory: str = "",
@@ -826,10 +893,46 @@ def add_deal(
     reliability: str = "reported",
     path: Path = DB_PATH,
 ) -> int:
-    """Insert a deal row. Skips silently if identical deal already exists (dedup). Returns deal id."""
+    """
+    Insert a deal row, or fill gaps on a matching existing one instead of
+    duplicating it.
+
+    Territory and broadcaster are normalized to their canonical entity name
+    first (see _normalize_deal_party), then a match is looked for on
+    (entity_id, normalized territory, normalized broadcaster, period_start,
+    period_end). A match updates only the currently-blank fields on the
+    existing row — it never overwrites data already there — and returns the
+    existing id instead of inserting a duplicate.
+
+    A value with no currency is never stored as a bare number: it's set to
+    null, the original figure is preserved in value_note, and the row is
+    flagged for review. Status is inferred from period_end (see
+    _infer_deal_status) — a clearly past period is always 'superseded'.
+    """
+    territory   = _normalize_deal_party(territory, path=path)
+    broadcaster = _normalize_deal_party(broadcaster, path=path)
+    rights_holder = (rights_holder or "").strip()
+    value_note    = (value_note or "").strip()
+    platform      = (platform or "").strip()
+    source_note   = (source_note or "").strip()
+    currency      = (currency or "").strip()
+    period_start  = (period_start or "").strip()
+    period_end    = (period_end or "").strip()
+
+    flagged = ""
+    if value is not None and value != 0 and not currency:
+        flagged = (
+            f"Value stated without currency ({value}"
+            f"{(' ' + value_note) if value_note else ''}) — needs manual currency confirmation."
+        )
+        value_note = f"[unconfirmed currency: {value}] {value_note}".strip()
+        value = None
+
+    status = _infer_deal_status(period_end, status)
+
     with _conn(path) as con:
         existing = con.execute("""
-            SELECT id FROM deals
+            SELECT * FROM deals
             WHERE entity_id=?
               AND deleted_at IS NULL
               AND LOWER(TRIM(territory))=LOWER(TRIM(?))
@@ -837,21 +940,160 @@ def add_deal(
               AND TRIM(period_start)=TRIM(?)
               AND TRIM(period_end)=TRIM(?)
         """, (entity_id, territory, broadcaster, period_start, period_end)).fetchone()
+
         if existing:
+            candidates = dict(
+                rights_holder=rights_holder, value=value, currency=currency,
+                value_note=value_note, platform=platform,
+                source_entry_id=source_entry_id, source_note=source_note,
+                flagged_for_review=flagged,
+            )
+            fills = {
+                field: new_val
+                for field, new_val in candidates.items()
+                if existing[field] in (None, "") and new_val not in (None, "")
+            }
+            if status == "superseded" and existing["status"] != "superseded":
+                fills["status"] = status
+            if fills:
+                con.execute(
+                    f"UPDATE deals SET {', '.join(f'{f}=?' for f in fills)}, "
+                    f"updated_at=datetime('now') WHERE id=?",
+                    list(fills.values()) + [existing["id"]],
+                )
             return existing["id"]
+
         cur = con.execute("""
             INSERT INTO deals
                 (entity_id, territory, broadcaster, rights_holder, value, currency,
                  value_note, period_start, period_end, platform,
-                 source_entry_id, source_note, status, reliability)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 source_entry_id, source_note, status, reliability, flagged_for_review)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            entity_id, territory.strip(), broadcaster.strip(), rights_holder.strip(),
-            value, currency.strip(), value_note.strip(),
-            period_start.strip(), period_end.strip(), platform.strip(),
-            source_entry_id, source_note.strip(), status, reliability,
+            entity_id, territory, broadcaster, rights_holder,
+            value, currency, value_note,
+            period_start, period_end, platform,
+            source_entry_id, source_note, status, reliability, flagged,
         ))
         return cur.lastrowid
+
+
+def flag_deals_missing_currency(dry_run: bool = True, path: Path = DB_PATH) -> list[dict]:
+    """
+    One-off hygiene pass for legacy rows written before add_deal() enforced
+    "currency required whenever a value is present" — e.g. a row storing
+    '2050.0m per season' with no currency. Unlike add_deal()'s handling of a
+    *new* extraction (where the raw figure can be preserved in value_note),
+    an existing row's value is left untouched here — we only mark it
+    flagged_for_review, since silently nulling a historical figure would be
+    a real data loss for a row we can't re-derive. Returns the rows that are
+    (or would be) flagged; dry_run=True makes no writes.
+    """
+    with _conn(path) as con:
+        rows = [dict(r) for r in con.execute("""
+            SELECT * FROM deals
+            WHERE deleted_at IS NULL AND value IS NOT NULL AND value != 0
+              AND TRIM(COALESCE(currency, '')) = '' AND TRIM(COALESCE(flagged_for_review, '')) = ''
+        """).fetchall()]
+        entity_names = {
+            r["id"]: r["canonical_name"]
+            for r in con.execute("SELECT id, canonical_name FROM entities").fetchall()
+        }
+
+    results = []
+    for r in rows:
+        reason = f"Value {r['value']} stored with no currency — needs manual currency confirmation."
+        results.append({
+            "id": r["id"], "entity": entity_names.get(r["entity_id"], f"#{r['entity_id']}"),
+            "territory": r.get("territory"), "broadcaster": r.get("broadcaster"),
+            "value": r["value"], "value_note": r.get("value_note"), "reason": reason,
+        })
+        if not dry_run:
+            with _conn(path) as con:
+                con.execute(
+                    "UPDATE deals SET flagged_for_review=?, updated_at=datetime('now') WHERE id=?",
+                    (reason, r["id"]),
+                )
+    return results
+
+
+def run_deal_dedupe(dry_run: bool = True, path: Path = DB_PATH) -> list[dict]:
+    """
+    One-off pass over every existing (non-deleted) deal row — for duplicates
+    created before add_deal() normalized/deduped on write. Groups on the same
+    key add_deal() uses (entity_id, normalized territory, normalized
+    broadcaster, period_start, period_end); within a group the row with the
+    most filled-in fields is kept, missing fields on it are backfilled from
+    the others, and the others are soft-deleted (deleted_at, recoverable like
+    every other soft delete in this app — never a hard delete).
+
+    Returns the merge plan either way: [{"keep": id, "merge": [ids...],
+    "entity": canonical_name, "territory":, "broadcaster":, "period": "..",
+    "fills": {...}}, ...]. With dry_run=True (the default) nothing is written
+    — call again with dry_run=False to actually apply the plan shown.
+    """
+    with _conn(path) as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM deals WHERE deleted_at IS NULL"
+        ).fetchall()]
+        entity_names = {
+            r["id"]: r["canonical_name"]
+            for r in con.execute("SELECT id, canonical_name FROM entities").fetchall()
+        }
+
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        key = (
+            r["entity_id"],
+            _normalize_deal_party(r.get("territory") or "", path=path).lower(),
+            _normalize_deal_party(r.get("broadcaster") or "", path=path).lower(),
+            (r.get("period_start") or "").strip(),
+            (r.get("period_end") or "").strip(),
+        )
+        groups.setdefault(key, []).append(r)
+
+    def _richness(d: dict) -> int:
+        return sum(1 for f in _DEAL_FILLABLE_FIELDS if d.get(f) not in (None, ""))
+
+    plans: list[dict] = []
+    for key, group in groups.items():
+        if len(group) < 2:
+            continue
+        group.sort(key=_richness, reverse=True)
+        keeper, dupes = group[0], group[1:]
+
+        fills = {}
+        for f in _DEAL_FILLABLE_FIELDS:
+            if keeper.get(f) in (None, ""):
+                for d in dupes:
+                    if d.get(f) not in (None, ""):
+                        fills[f] = d[f]
+                        break
+
+        plans.append({
+            "keep": keeper["id"],
+            "merge": [d["id"] for d in dupes],
+            "entity": entity_names.get(key[0], f"#{key[0]}"),
+            "territory": keeper.get("territory"),
+            "broadcaster": keeper.get("broadcaster"),
+            "period": f"{keeper.get('period_start','')}–{keeper.get('period_end','')}",
+            "fills": fills,
+        })
+
+        if not dry_run:
+            with _conn(path) as con:
+                if fills:
+                    con.execute(
+                        f"UPDATE deals SET {', '.join(f'{f}=?' for f in fills)}, "
+                        f"updated_at=datetime('now') WHERE id=?",
+                        list(fills.values()) + [keeper["id"]],
+                    )
+                for d in dupes:
+                    con.execute(
+                        "UPDATE deals SET deleted_at=datetime('now') WHERE id=?", (d["id"],)
+                    )
+
+    return plans
 
 
 def get_deals_for_entity(
@@ -911,6 +1153,16 @@ def update_deal(deal_id: int, path: Path = DB_PATH, **fields) -> None:
     values = [v for v in fields.values() if v != "datetime('now')"]
     with _conn(path) as con:
         con.execute(f"UPDATE deals SET {set_clause} WHERE id=?", values + [deal_id])
+
+
+def delete_deal(deal_id: int, path: Path = DB_PATH) -> None:
+    """Soft-delete a deal row — recoverable at the DB level like every other
+    soft delete in this app, though there's no dedicated recycle-bin UI for
+    deals specifically (unlike entries)."""
+    with _conn(path) as con:
+        con.execute(
+            "UPDATE deals SET deleted_at=datetime('now') WHERE id=?", (deal_id,)
+        )
 
 
 def mark_deal_superseded(deal_id: int, superseded_by_id: int, path: Path = DB_PATH) -> None:

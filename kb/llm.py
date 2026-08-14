@@ -847,51 +847,76 @@ _DEAL_EXTRACT_SYSTEM = textwrap.dedent("""
 """).strip()
 
 
+_DEAL_MAX_ATTEMPTS = 3  # same claude-CLI-fallback flakiness as resolve_entities_async — see its docstring
+
+
+def _deal_prompt(text: str, entity_names: list[str], source_hint: str) -> str:
+    hint = f"Source: {source_hint}\n\n" if source_hint else ""
+    return f"{hint}Text:\n\n{text[:15000]}"
+
+
 def extract_deals(
     text: str,
     entity_names: list[str],
     source_hint: str = "",
+    max_attempts: int = _DEAL_MAX_ATTEMPTS,
 ) -> list[dict]:
     """
     Extract structured deal terms from text. entity_names are the canonical entity names
     relevant to this document/snippet. Returns [] on failure or if nothing found.
+
+    Retries on a failed call or an unparseable response — same rationale as
+    resolve_entities(): the claude-CLI fallback intermittently times out or
+    declines to return the requested JSON, and a first-attempt failure isn't
+    trustworthy enough to accept as "no deals found".
     """
     if not entity_names or not text.strip():
         return []
     system = _DEAL_EXTRACT_SYSTEM + "\n" + "\n".join(f"- {n}" for n in entity_names)
-    hint = f"Source: {source_hint}\n\n" if source_hint else ""
-    user = f"{hint}Text:\n\n{text[:15000]}"
-    try:
-        raw = call_claude(system, user, model=CLASSIFY_MODEL, max_tokens=2000, timeout=150)
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = "\n".join(raw.split("\n")[1:]).rsplit("```", 1)[0].strip()
-        result = json.loads(raw)
-        return result if isinstance(result, list) else []
-    except Exception:
-        return []
+    user = _deal_prompt(text, entity_names, source_hint)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            raw = call_claude(system, user, model=CLASSIFY_MODEL, max_tokens=2000, timeout=150)
+        except Exception as e:
+            log.warning("extract_deals: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
+            continue
+        result = _parse_json_array(raw)  # same "parse a JSON array, else None" logic
+        if result is not None:
+            return result
+        log.warning(
+            "extract_deals: JSON parse failed (attempt %d/%d) — raw response: %r",
+            attempt, max_attempts, raw[:300],
+        )
+    log.warning("extract_deals: all %d attempts failed — returning no deals", max_attempts)
+    return []
 
 
 async def extract_deals_async(
     text: str,
     entity_names: list[str],
     source_hint: str = "",
+    max_attempts: int = _DEAL_MAX_ATTEMPTS,
 ) -> list[dict]:
-    """Async version of extract_deals for use during batch ingestion."""
+    """Async counterpart of extract_deals() — see its docstring for the retry rationale."""
     if not entity_names or not text.strip():
         return []
     system = _DEAL_EXTRACT_SYSTEM + "\n" + "\n".join(f"- {n}" for n in entity_names)
-    hint = f"Source: {source_hint}\n\n" if source_hint else ""
-    user = f"{hint}Text:\n\n{text[:15000]}"
-    try:
-        raw = await call_claude_async(system, user, model=CLASSIFY_MODEL, max_tokens=1500)
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = "\n".join(raw.split("\n")[1:]).rsplit("```", 1)[0].strip()
-        result = json.loads(raw)
-        return result if isinstance(result, list) else []
-    except Exception:
-        return []
+    user = _deal_prompt(text, entity_names, source_hint)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            raw = await call_claude_async(system, user, model=CLASSIFY_MODEL, max_tokens=1500)
+        except Exception as e:
+            log.warning("extract_deals_async: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
+            continue
+        result = _parse_json_array(raw)
+        if result is not None:
+            return result
+        log.warning(
+            "extract_deals_async: JSON parse failed (attempt %d/%d) — raw response: %r",
+            attempt, max_attempts, raw[:300],
+        )
+    log.warning("extract_deals_async: all %d attempts failed — returning no deals", max_attempts)
+    return []
 
 
 # ── Entity resolution ─────────────────────────────────────────────────────────
@@ -959,7 +984,7 @@ def _entity_metadata_text(metadata: dict, source: str = "") -> str:
     return "\n".join(lines)
 
 
-def _parse_entity_list(raw: str) -> Optional[list[dict]]:
+def _parse_json_array(raw: str) -> Optional[list[dict]]:
     """Returns the parsed list, or None if raw isn't a parseable JSON array."""
     try:
         result = json.loads(_strip_fences(raw))
@@ -1001,7 +1026,7 @@ def resolve_entities(metadata: dict, source: str = "", max_attempts: int = _ENTI
         except Exception as e:
             log.warning("resolve_entities: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
             continue
-        result = _parse_entity_list(raw)
+        result = _parse_json_array(raw)
         if result is None:
             log.warning(
                 "resolve_entities: JSON parse failed (attempt %d/%d) — raw response: %r",
@@ -1038,7 +1063,7 @@ async def resolve_entities_async(metadata: dict, source: str = "", max_attempts:
         except Exception as e:
             log.warning("resolve_entities_async: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
             continue
-        result = _parse_entity_list(raw)
+        result = _parse_json_array(raw)
         if result is None:
             log.warning(
                 "resolve_entities_async: JSON parse failed (attempt %d/%d) — raw response: %r",

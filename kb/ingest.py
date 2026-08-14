@@ -21,7 +21,7 @@ import pdfplumber
 from pptx import Presentation
 
 from config import (
-    DOCS_DIR, DB_PATH, INGEST_BATCH_SIZE,
+    DOCS_DIR, DB_PATH, INGEST_BATCH_SIZE, DEAL_EXTRACT_CONCURRENCY,
     MAX_CHARS_PER_DOC, MAX_CHARS_PER_CHUNK, OCR_CHAR_THRESHOLD,
     VISION_CHAR_THRESHOLD, VISION_IMAGE_COUNT_THRESHOLD, VISION_HYBRID_MAX_CHARS,
     VALIDATION_MIN_FILE_BYTES, VALIDATION_MIN_CHARS_PER_KB,
@@ -596,7 +596,17 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
         resolved = []
         n_entities = 0
 
-    # Extract and store structured deals
+    # Extract and store structured deals — per chunk, not the truncated
+    # whole-document `txt`. `txt` is capped at MAX_CHARS_PER_DOC and shares
+    # that budget proportionally across every chunk (see full_text()), so a
+    # slide's "Media rights deals" section — which tends to come after
+    # Overview/Audience — is often cut off before the model ever sees it.
+    # Running per-chunk on the full untruncated text closes that gap, at the
+    # cost of one extraction call per page/slide instead of one per document.
+    # Concurrency is capped (DEAL_EXTRACT_CONCURRENCY) rather than firing every
+    # chunk at once — with e.g. 13 chunks, unbounded concurrency has been
+    # observed to overload the claude-CLI fallback badly enough that calls
+    # which would otherwise succeed time out purely from the contention.
     n_deals = 0
     try:
         canonical_names = [
@@ -605,31 +615,39 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
             if r.get("canonical", "").strip()
         ]
         if canonical_names:
-            raw_deals = await extract_deals_async(txt, canonical_names, source_hint=source)
-            for d in raw_deals:
-                en = (d.get("entity_name") or "").strip()
-                entity_row = db.find_entity_by_name_or_alias(en)
-                if entity_row:
-                    confidence   = d.get("confidence", "medium")
-                    entry_rel    = meta.get("reliability", "reported")
-                    deal_status  = "unverified" if confidence == "low" else "current"
-                    db.add_deal(
-                        entity_id       = entity_row["id"],
-                        territory       = d.get("territory", ""),
-                        broadcaster     = d.get("broadcaster", ""),
-                        rights_holder   = d.get("rights_holder", ""),
-                        value           = d.get("value"),
-                        currency        = d.get("currency", ""),
-                        value_note      = d.get("value_note", ""),
-                        period_start    = d.get("period_start", ""),
-                        period_end      = d.get("period_end", ""),
-                        platform        = d.get("platform", ""),
-                        source_entry_id = entry_id,
-                        source_note     = source,
-                        status          = deal_status,
-                        reliability     = entry_rel,
-                    )
-                    n_deals += 1
+            sem = asyncio.Semaphore(DEAL_EXTRACT_CONCURRENCY)
+
+            async def _extract_chunk_deals(c):
+                async with sem:
+                    hint = f"{source} — {c.chunk_type} {c.chunk_num}"
+                    return await extract_deals_async(c.text, canonical_names, source_hint=hint)
+
+            per_chunk_deals = await asyncio.gather(*[_extract_chunk_deals(c) for c in result.chunks])
+            entry_rel = meta.get("reliability", "reported")
+            for raw_deals in per_chunk_deals:
+                for d in raw_deals:
+                    en = (d.get("entity_name") or "").strip()
+                    entity_row = db.find_entity_by_name_or_alias(en)
+                    if entity_row:
+                        confidence  = d.get("confidence", "medium")
+                        deal_status = "unverified" if confidence == "low" else "current"
+                        db.add_deal(
+                            entity_id       = entity_row["id"],
+                            territory       = d.get("territory", ""),
+                            broadcaster     = d.get("broadcaster", ""),
+                            rights_holder   = d.get("rights_holder", ""),
+                            value           = d.get("value"),
+                            currency        = d.get("currency", ""),
+                            value_note      = d.get("value_note", ""),
+                            period_start    = d.get("period_start", ""),
+                            period_end      = d.get("period_end", ""),
+                            platform        = d.get("platform", ""),
+                            source_entry_id = entry_id,
+                            source_note     = source,
+                            status          = deal_status,
+                            reliability     = entry_rel,
+                        )
+                        n_deals += 1
     except Exception as e:
         log.warning("Deal extraction failed for %s: %s", source, e)
 
