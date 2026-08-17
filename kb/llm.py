@@ -848,11 +848,34 @@ _DEAL_EXTRACT_SYSTEM = textwrap.dedent("""
 
 
 _DEAL_MAX_ATTEMPTS = 3  # same claude-CLI-fallback flakiness as resolve_entities_async — see its docstring
+_DEAL_MAX_TOKENS = 4096  # a dense slide (~20 territory/broadcaster rows) needs ~1800-2000 output
+                         # tokens for valid JSON; the old 1500/2000 caps were silent-truncation
+                         # risk on the SDK path (the CLI-subprocess fallback ignores max_tokens
+                         # entirely, which is why this alone doesn't explain every observed case —
+                         # see _looks_incomplete below for the other half of the fix)
 
 
 def _deal_prompt(text: str, entity_names: list[str], source_hint: str) -> str:
     hint = f"Source: {source_hint}\n\n" if source_hint else ""
     return f"{hint}Text:\n\n{text[:15000]}"
+
+
+_BULLET_CURRENCY_RE = re.compile(r"^[ \t]*[•\-][^\n]*[$€£]\s?\d", re.MULTILINE)
+
+
+def _looks_incomplete(text: str, result: list[dict]) -> bool:
+    """
+    Heuristic check for a syntactically valid but suspiciously partial deal
+    list — e.g. a slide with ~19 broadcaster/territory bullets that comes back
+    with 1 parsed row. A malformed/unparseable response is already retried
+    (see the caller's loop); this catches the sibling failure mode where the
+    CLI-fallback model returns well-formed JSON that simply stopped early,
+    which the old "did json.loads succeed?" check couldn't detect at all.
+    Only fires when the text is dense enough (>=6 currency-bearing bullets)
+    to distinguish a real miss from a legitimately short deal list.
+    """
+    n_bullets = len(_BULLET_CURRENCY_RE.findall(text))
+    return n_bullets >= 6 and len(result) < max(1, n_bullets // 3)
 
 
 def extract_deals(
@@ -865,30 +888,39 @@ def extract_deals(
     Extract structured deal terms from text. entity_names are the canonical entity names
     relevant to this document/snippet. Returns [] on failure or if nothing found.
 
-    Retries on a failed call or an unparseable response — same rationale as
-    resolve_entities(): the claude-CLI fallback intermittently times out or
-    declines to return the requested JSON, and a first-attempt failure isn't
-    trustworthy enough to accept as "no deals found".
+    Retries on a failed call, an unparseable response, or a parsed-but-implausibly-
+    partial one (see _looks_incomplete) — same rationale as resolve_entities():
+    the claude-CLI fallback intermittently times out, declines to return the
+    requested JSON, or silently stops partway through a long list, and none of
+    those first-attempt outcomes is trustworthy enough to accept as final.
     """
     if not entity_names or not text.strip():
         return []
     system = _DEAL_EXTRACT_SYSTEM + "\n" + "\n".join(f"- {n}" for n in entity_names)
     user = _deal_prompt(text, entity_names, source_hint)
+    last_result: list[dict] = []
     for attempt in range(1, max_attempts + 1):
         try:
-            raw = call_claude(system, user, model=CLASSIFY_MODEL, max_tokens=2000, timeout=150)
+            raw = call_claude(system, user, model=CLASSIFY_MODEL, max_tokens=_DEAL_MAX_TOKENS, timeout=150)
         except Exception as e:
             log.warning("extract_deals: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
             continue
         result = _parse_json_array(raw)  # same "parse a JSON array, else None" logic
         if result is not None:
+            last_result = result
+            if attempt < max_attempts and _looks_incomplete(text, result):
+                log.warning(
+                    "extract_deals: parsed only %d deal(s) from a bullet-dense chunk — "
+                    "retrying (attempt %d/%d)", len(result), attempt, max_attempts,
+                )
+                continue
             return result
         log.warning(
             "extract_deals: JSON parse failed (attempt %d/%d) — raw response: %r",
             attempt, max_attempts, raw[:300],
         )
-    log.warning("extract_deals: all %d attempts failed — returning no deals", max_attempts)
-    return []
+    log.warning("extract_deals: all %d attempts failed or incomplete — returning best result", max_attempts)
+    return last_result
 
 
 async def extract_deals_async(
@@ -902,21 +934,29 @@ async def extract_deals_async(
         return []
     system = _DEAL_EXTRACT_SYSTEM + "\n" + "\n".join(f"- {n}" for n in entity_names)
     user = _deal_prompt(text, entity_names, source_hint)
+    last_result: list[dict] = []
     for attempt in range(1, max_attempts + 1):
         try:
-            raw = await call_claude_async(system, user, model=CLASSIFY_MODEL, max_tokens=1500)
+            raw = await call_claude_async(system, user, model=CLASSIFY_MODEL, max_tokens=_DEAL_MAX_TOKENS)
         except Exception as e:
             log.warning("extract_deals_async: call failed (attempt %d/%d): %s", attempt, max_attempts, e)
             continue
         result = _parse_json_array(raw)
         if result is not None:
+            last_result = result
+            if attempt < max_attempts and _looks_incomplete(text, result):
+                log.warning(
+                    "extract_deals_async: parsed only %d deal(s) from a bullet-dense chunk — "
+                    "retrying (attempt %d/%d)", len(result), attempt, max_attempts,
+                )
+                continue
             return result
         log.warning(
             "extract_deals_async: JSON parse failed (attempt %d/%d) — raw response: %r",
             attempt, max_attempts, raw[:300],
         )
-    log.warning("extract_deals_async: all %d attempts failed — returning no deals", max_attempts)
-    return []
+    log.warning("extract_deals_async: all %d attempts failed or incomplete — returning best result", max_attempts)
+    return last_result
 
 
 # ── Entity resolution ─────────────────────────────────────────────────────────

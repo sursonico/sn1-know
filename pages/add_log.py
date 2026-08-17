@@ -286,6 +286,7 @@ def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int, i
 
     entry_rel = entry.get("reliability", "reported") or "reported"
     n_deals_written = 0
+    chunk_deal_counts: list[tuple[int, str, int]] = []
     for chunk in chunks:
         cid = chunk["id"]
         page_names = [n.strip() for n in (st.session_state.get(f"pgent_{cid}", []) or []) if n.strip()]
@@ -301,6 +302,7 @@ def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int, i
             )
         except Exception:
             raw_deals = []
+        chunk_deal_counts.append((chunk.get("chunk_num"), page_text, len(raw_deals)))
         for d in raw_deals:
             en = (d.get("entity_name") or "").strip()
             if en not in page_names:
@@ -333,7 +335,7 @@ def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int, i
         except OSError:
             file_size = 0
     warning = _compute_validation_warning(
-        [c.get("text") or "" for c in fresh_chunks], file_size, len(fresh_entities),
+        [c.get("text") or "" for c in fresh_chunks], file_size, len(fresh_entities), chunk_deal_counts,
     )
     set_validation_warning(eid, warning)
 

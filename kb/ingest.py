@@ -57,13 +57,82 @@ class ExtractionResult:
 
 # ── Text extraction ───────────────────────────────────────────────────────────
 
+_COLUMN_GAP_PT = 18.0  # x0 gap that marks a column boundary, empirically tuned
+                       # against the PROPERTIES OVERVIEW deck's 5-column layout
+
+
+def _detect_column_edges(words: list[dict], page_width: float) -> Optional[list[float]]:
+    """Return x-axis column boundaries, or None if the page reads as one column."""
+    if not words:
+        return None
+    xs_sorted = sorted(w["x0"] for w in words)
+    gaps = [(a, b) for a, b in zip(xs_sorted, xs_sorted[1:]) if b - a > _COLUMN_GAP_PT]
+    if not gaps:
+        return None
+    edges = [0.0] + [(a + b) / 2 for a, b in gaps] + [page_width]
+    # A wide final gap can push its midpoint past the page edge; page.crop()
+    # raises on a bbox outside page bounds, so clamp it back in.
+    edges[-1] = min(edges[-1], page_width)
+    return edges
+
+
+def _extract_pdf_page_text(page) -> str:
+    """
+    Extract page text in left-to-right column order instead of raw word
+    position. Side-by-side sections (e.g. "Overview | Audience | Media rights
+    deals | Analysis") read out of order under plain extract_text(), which
+    walks words top-to-bottom across the whole page width and splices
+    unrelated columns mid-sentence. Detects column boundaries as gaps
+    >_COLUMN_GAP_PT in the sorted x0 distribution, crops each band, and
+    concatenates column-by-column.
+    """
+    try:
+        words = page.extract_words()
+    except Exception:
+        words = []
+
+    edges = _detect_column_edges(words, page.width)
+    if not edges:
+        return (page.extract_text() or "").strip()
+
+    bands = [[lo, hi, [w for w in words if lo <= w["x0"] < hi]] for lo, hi in zip(edges, edges[1:])]
+
+    # A sliver band (a stray right-aligned page number, a logo) isn't a real
+    # column — merge it into the previous band rather than cropping it alone,
+    # which would scramble reading order instead of fixing it.
+    merged: list[list] = []
+    for lo, hi, band_words in bands:
+        if merged and len(band_words) < 3:
+            merged[-1][1] = hi
+            merged[-1][2].extend(band_words)
+        else:
+            merged.append([lo, hi, band_words])
+
+    if len(merged) < 2:
+        return (page.extract_text() or "").strip()
+
+    column_texts = []
+    for lo, hi, band_words in merged:
+        if not band_words:
+            continue
+        bbox = (max(lo, 0.0), 0.0, min(hi, page.width), page.height)
+        try:
+            text = (page.crop(bbox).extract_text() or "").strip()
+        except Exception:
+            text = ""
+        if text:
+            column_texts.append(text)
+
+    return "\n\n".join(column_texts) if column_texts else (page.extract_text() or "").strip()
+
+
 def _extract_pdf(path: Path) -> ExtractionResult:
     chunks: list[Chunk] = []
     scanned_pages: list[int] = []
     try:
         with pdfplumber.open(path) as pdf:
             for i, page in enumerate(pdf.pages, start=1):
-                text = (page.extract_text() or "").strip()
+                text = _extract_pdf_page_text(page)
                 n_images = len(page.images)
                 if len(text) < OCR_CHAR_THRESHOLD:
                     scanned_pages.append(i)
@@ -318,8 +387,17 @@ def _collect_pptx_shape_text(shapes) -> list[str]:
     Many decks lay out slide body content (stat callouts, bullet lists) inside
     grouped shapes rather than directly on the slide — a flat top-level scan
     only picks up the slide title and leaves everything else unextracted.
+
+    Shapes are sorted by position (.left, then .top) at each recursion level
+    before their text is collected — raw shape/document order does not match
+    reading order in multi-column layouts, splicing side-by-side sections
+    together the same way an unsorted PDF word list does.
     """
     texts: list[str] = []
+    try:
+        shapes = sorted(shapes, key=lambda s: (getattr(s, "left", None) or 0, getattr(s, "top", None) or 0))
+    except Exception:
+        pass
     for shape in shapes:
         if shape.shape_type == 6:  # MSO_SHAPE_TYPE.GROUP
             try:
@@ -440,10 +518,14 @@ def find_possible_duplicate(source: str, existing_sources: list[str]) -> Optiona
 
 # ── Post-ingest validation (advisory — never blocks ingestion) ───────────────
 
+_BULLET_CURRENCY_RE = re.compile(r"^[ \t]*[•\-][^\n]*[$€£]\s?\d", re.MULTILINE)
+
+
 def _compute_validation_warning(
     chunk_texts: list[str],
     file_size_bytes: int,
     n_entities: int,
+    chunk_deal_counts: Optional[list[tuple[int, str, int]]] = None,
 ) -> str:
     """
     Flag likely-incomplete ingestion so it can be surfaced for human review.
@@ -454,7 +536,7 @@ def _compute_validation_warning(
     adds entity links, using data read straight back from the DB — see
     pages/add_log.py's "Save corrections" flow.
 
-    Two independent checks, joined if both fire:
+    Three independent checks, joined if more than one fires:
       1. Thin extraction: total extracted chars are low relative to file size.
          Skipped below VALIDATION_MIN_FILE_BYTES so small, legitimately sparse
          files (a one-line note, a short single-page PDF) aren't flagged.
@@ -463,6 +545,23 @@ def _compute_validation_warning(
          fewer distinct entities than sections — the exact pattern that hid the
          SPORTS PROPERTIES OVERVIEW group-shape extraction bug (13 slides, 0
          entities).
+      3. Silent per-chunk deal-extraction shortfall: `chunk_deal_counts` is
+         (chunk_num, text, n_deals) for every chunk extraction was actually
+         attempted on. Counts currency-bearing bullet lines in the text as a
+         proxy for how many deals the page plausibly has, and flags any chunk
+         where the written count is well below that — not just zero. A page
+         losing 18 of 19 deals (Serie A: 19 bullets, 1 written) is exactly as
+         damaging as one losing all of them, and a zero-only check misses it
+         entirely. Checking per-chunk rather than a document-level total also
+         matters on its own: a page that fails out of a 13-page deck still
+         leaves the *document* total well above zero, so an aggregate check
+         never fires even though that one page's deals are silently missing —
+         what happened to Formula 1/NHL/WTA in PROPERTIES OVERVIEW.pdf's first
+         re-ingest. Only fires on chunks dense enough (>=4 bullets) to trust
+         the signal, and only when the shortfall is severe (written count
+         under half the bullet count) — a looser bar than the retry-time
+         check in kb.llm._looks_incomplete, since this is the last line of
+         defense after retries are already exhausted.
     """
     warnings: list[str] = []
     n_chunks = len(chunk_texts)
@@ -482,6 +581,18 @@ def _compute_validation_warning(
             warnings.append(
                 f"Only {n_entities} entit{'y' if n_entities == 1 else 'ies'} linked "
                 f"across {n_chunks} slides/pages"
+            )
+
+    if chunk_deal_counts:
+        flagged = []
+        for chunk_num, text, n_deals in chunk_deal_counts:
+            n_bullets = len(_BULLET_CURRENCY_RE.findall(text))
+            if n_bullets >= 4 and n_deals < max(1, n_bullets // 2):
+                flagged.append(f"{chunk_num} ({n_deals}/{n_bullets})")
+        if flagged:
+            warnings.append(
+                f"Deal count implausibly low vs. currency bullets on page(s)/slide(s) "
+                f"{', '.join(flagged)} (written/bullets)"
             )
 
     if not warnings:
@@ -608,6 +719,7 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
     # observed to overload the claude-CLI fallback badly enough that calls
     # which would otherwise succeed time out purely from the contention.
     n_deals = 0
+    chunk_deal_counts: list[tuple[int, str, int]] = []
     try:
         canonical_names = [
             r.get("canonical", "").strip()
@@ -623,6 +735,10 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
                     return await extract_deals_async(c.text, canonical_names, source_hint=hint)
 
             per_chunk_deals = await asyncio.gather(*[_extract_chunk_deals(c) for c in result.chunks])
+            chunk_deal_counts = [
+                (c.chunk_num, c.text, len(raw))
+                for c, raw in zip(result.chunks, per_chunk_deals)
+            ]
             entry_rel = meta.get("reliability", "reported")
             for raw_deals in per_chunk_deals:
                 for d in raw_deals:
@@ -653,7 +769,7 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
 
     # Post-ingest validation: advisory only, never blocks — see docstring.
     warning = _compute_validation_warning(
-        [c.text for c in result.chunks], path.stat().st_size, n_entities,
+        [c.text for c in result.chunks], path.stat().st_size, n_entities, chunk_deal_counts,
     )
     db.set_validation_warning(entry_id, warning)
 
