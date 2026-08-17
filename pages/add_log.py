@@ -13,7 +13,6 @@ from kb.db import (
     add_deal, update_deal, delete_deal, get_deals_for_entity, find_entity_by_name_or_alias,
     get_entities_for_entry, get_chunks_for_entries, get_all_entries,
     get_all_entities, update_chunk_text, set_validation_warning,
-    get_all_drafts, get_draft, commit_draft_document, discard_draft, purge_expired_drafts,
 )
 from kb.llm import (
     enrich_snippet, enrich_url_article, enrich_document,
@@ -25,7 +24,7 @@ from kb.ingest import (
     _compute_validation_warning, _render_pdf_page_image, _extract_pptx_slide_images,
 )
 from kb.web import fetch_article, error_message
-from config import DOCS_DIR, DRAFT_RETENTION_DAYS
+from config import DOCS_DIR
 
 page_setup("add_log", title="Add & Log — SN1 Knowledge Base")
 
@@ -341,128 +340,6 @@ def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int, i
     return n_text_edits, n_entities_added, n_deals_written
 
 
-def _render_draft_card(draft: dict) -> None:
-    """
-    Read-only review of a staged (not-yet-committed) document: summary, tags,
-    detected entities/deals, per-page text + thumbnail, and the two actions
-    that resolve a draft — Confirm (writes everything live in one transaction
-    via db.commit_draft_document) or Discard (hard-delete via db.discard_draft
-    — a draft was never live, so there's no recycle-bin step). Nothing here
-    is editable; corrections happen after confirming, via "Review or correct
-    an existing document" below, which is the same tool used on any live doc.
-    """
-    did      = draft["id"]
-    fname    = draft.get("source", "(untitled)")
-    chunks   = draft.get("chunks", [])
-    entities = draft.get("entities", [])
-    deals    = draft.get("deals", [])
-    n_pages  = len(chunks)
-    age      = draft.get("age_days", 0)
-    summary  = draft.get("summary") or ""
-
-    thin = []
-    if not summary.strip():            thin.append("no summary extracted")
-    elif len(summary) < 100:           thin.append("summary is short")
-    if not entities:                   thin.append("no entities detected")
-    if draft.get("ingest_error"):      thin.append(draft["ingest_error"][:60])
-    if draft.get("validation_warning"): thin.append(draft["validation_warning"])
-
-    thin_badge = (
-        '&nbsp;<span style="font-size:0.7rem;background:#fff3cd;color:#856404;'
-        'padding:2px 7px;border-radius:10px;font-weight:600">⚠ THIN</span>'
-    ) if thin else ""
-    st.markdown(
-        f'<div style="margin-top:0.9rem">'
-        f'<span style="font-weight:600;font-size:0.95rem;color:#2B383E">📄 {fname}</span>'
-        f'&nbsp;&nbsp;<span style="font-size:0.7rem;background:#eef0f4;color:#2B383E;'
-        f'padding:2px 7px;border-radius:10px;font-weight:600">◔ DRAFT — not yet live</span>'
-        f'{thin_badge}</div>',
-        unsafe_allow_html=True,
-    )
-
-    m_parts = []
-    if n_pages:               m_parts.append(f"{n_pages} page{'s' if n_pages != 1 else ''}")
-    if draft.get("doc_type"): m_parts.append(draft["doc_type"])
-    m_parts.append("staged today" if age < 1 else f"staged {age} day{'s' if age != 1 else ''} ago")
-    st.caption(" · ".join(m_parts))
-
-    if summary:
-        st.markdown(
-            f'<div style="font-size:0.86rem;color:#444;margin:0.15rem 0 0.25rem">'
-            f'{summary[:300]}{"…" if len(summary) > 300 else ""}</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.caption("_(no summary extracted)_")
-
-    t_parts = []
-    if draft.get("org_tags"):    t_parts.append(f"**Org:** {draft['org_tags']}")
-    if draft.get("market_tags"): t_parts.append(f"**Markets:** {draft['market_tags']}")
-    if draft.get("sport_tags"):  t_parts.append(f"**Sport:** {draft['sport_tags']}")
-    if draft.get("topic_tags"):  t_parts.append(f"**Topics:** {draft['topic_tags']}")
-    if t_parts:
-        st.markdown("  ·  ".join(t_parts))
-    else:
-        st.caption("_(no tags extracted)_")
-
-    if entities:
-        badges = []
-        for r in entities:
-            c = _ETYPE_COLORS.get(r.get("type", "other"), "#8A9598")
-            badges.append(
-                f'<span style="font-size:0.65rem;font-weight:700;text-transform:uppercase;'
-                f'color:{c}">{r.get("type","other")}</span>'
-                f'&nbsp;<span style="font-size:0.82rem">{r.get("canonical","?")}</span>'
-            )
-        st.markdown(
-            '<div style="margin:0.2rem 0">' + "&ensp;·&ensp;".join(badges)
-            + '</div><div style="font-size:0.75rem;color:#888">detected — linked on confirm, not yet</div>',
-            unsafe_allow_html=True,
-        )
-    if deals:
-        st.caption(f"{len(deals)} deal row{'s' if len(deals) != 1 else ''} detected — written on confirm, not yet.")
-
-    if thin:
-        st.warning("⚠ Low-confidence extraction  ·  " + "  ·  ".join(thin), icon=None)
-
-    if chunks:
-        with st.expander(f"Pages ({n_pages})", expanded=False):
-            src_path = resolve_source_file(draft)
-            for c in chunks:
-                text = c.get("text") or ""
-                st.markdown(f"**{c.get('chunk_type','page').capitalize()} {c.get('chunk_num','?')}**")
-                col_t, col_i = st.columns([3, 2])
-                with col_t:
-                    st.text(text[:600] + ("…" if len(text) > 600 else "") if text.strip() else "_(nothing extracted)_")
-                with col_i:
-                    thumb = None
-                    if src_path is not None:
-                        try:
-                            thumb = _page_thumbnail(
-                                str(src_path), src_path.stat().st_mtime,
-                                c.get("chunk_type", ""), (c.get("chunk_num") or 1) - 1,
-                            )
-                        except Exception:
-                            thumb = None
-                    if thumb:
-                        st.image(thumb, use_container_width=True)
-                    else:
-                        st.caption("_No image available_")
-                st.divider()
-
-    col_confirm, col_discard = st.columns(2)
-    if col_confirm.button("✅ Confirm — add to knowledge base", key=f"confirm_{did}", type="primary"):
-        entry_id = commit_draft_document(did)
-        st.session_state["draft_flash"] = (fname, "confirmed", entry_id)
-        st.rerun()
-    if col_discard.button("🗑 Discard", key=f"discard_{did}", type="secondary"):
-        discard_draft(did)
-        st.session_state["draft_flash"] = (fname, "discarded", None)
-        st.rerun()
-
-    st.divider()
-
-
 def _render_review_card(entry: dict) -> None:
     fname     = entry.get("source", "(untitled)")
     eid       = entry["id"]
@@ -607,139 +484,137 @@ def _render_review_card(entry: dict) -> None:
 # ── Add Documents ─────────────────────────────────────────────────────────────
 with tab_add:
     section_title("Add documents")
-    st.caption(
-        "Files are SHA-256 hashed; unchanged files are skipped automatically. "
-        "Uploading extracts and stages a document as a **draft** — nothing is "
-        "added to the live knowledge base (Ask, Browse, entity hubs) until you "
-        "explicitly click Confirm below."
-    )
 
-    uploaded = st.file_uploader(
-        "Drag files here", type=["pdf","pptx","xlsx","xls"],
-        accept_multiple_files=True, label_visibility="collapsed",
-    )
-    if uploaded:
-        st.write(f"**{len(uploaded)} file(s) ready:**")
-        DOCS_DIR.mkdir(parents=True, exist_ok=True)
-        for uf in uploaded:
-            exists = (DOCS_DIR / uf.name).exists()
-            st.write(f"- {uf.name}{'  _(already exists)_' if exists else ''}")
-
-    if st.button(f"Process {len(uploaded)} file(s)" if uploaded else "Process files",
-                 type="primary", disabled=not uploaded):
-        DOCS_DIR.mkdir(parents=True, exist_ok=True)
-        saved = []
-        for uf in uploaded:
-            dest = DOCS_DIR / uf.name
-            dest.write_bytes(uf.getvalue())
-            saved.append(dest)
-        with st.spinner("Extracting and classifying — nothing is saved live until you confirm…"):
-            results = asyncio.run(ingest_all_async(saved, commit=False))
-        st.session_state["stage_results"] = results
-        st.rerun()
-
-    stage_results = st.session_state.pop("stage_results", None)
-    if stage_results:
-        n_staged = sum(1 for r in stage_results if r.startswith("DRAFT") and "ERROR" not in r and "EMPTY" not in r)
-        n_skip   = sum(1 for r in stage_results if r.startswith("SKIP"))
-        n_other  = len(stage_results) - n_staged - n_skip
-        parts = []
-        if n_staged: parts.append(f"**{n_staged} staged** as draft(s) below")
-        if n_skip:   parts.append(f"{n_skip} skipped (unchanged, already live)")
-        if n_other:  parts.append(f"**{n_other} failed**")
-        st.success(", ".join(parts) + ".")
-        for r in stage_results:
-            if n_other and not r.startswith(("DRAFT", "SKIP")):
-                st.error(r)
-
-    # ── Pending drafts — always visible, not just right after upload, so an ─
-    # abandoned draft shows up next time this page is opened instead of
-    # silently accumulating.
-    st.divider()
-    drafts = get_all_drafts()
-    section_title(f"📋 Pending drafts ({len(drafts)})")
-
-    flash = st.session_state.pop("draft_flash", None)
-    if flash:
-        fname, action, entry_id = flash
-        if action == "confirmed":
-            st.success(f"✅ Confirmed — **{fname}** is now live (entry #{entry_id}) in Ask, Browse and its entity hub(s).")
-        else:
-            st.info(f"🗑 Discarded **{fname}** — it was never added to the live database; nothing to clean up.")
-
-    if not drafts:
-        st.caption("No pending drafts.")
-    else:
-        expired = [d for d in drafts if d["age_days"] >= DRAFT_RETENTION_DAYS]
-        if expired:
-            st.warning(
-                f"{len(expired)} draft{'s' if len(expired)!=1 else ''} older than "
-                f"{DRAFT_RETENTION_DAYS} days.",
-                icon="⏳",
-            )
-            if st.button(f"Purge {len(expired)} expired draft(s)", key="purge_expired_drafts", type="secondary"):
-                n = purge_expired_drafts(DRAFT_RETENTION_DAYS)
-                st.success(f"Purged {n} expired draft(s).")
-                st.rerun()
-        for d in drafts:
-            _render_draft_card(d)
-
-    # ── Review or correct an existing (live, confirmed) document ────────────────
-    st.divider()
-    with st.expander("🔍 Review or correct an existing document"):
+    # ── Post-ingest review ─────────────────────────────────────────────────────
+    if "doc_review" in st.session_state:
+        dr = st.session_state["doc_review"]
+        n_ok   = sum(1 for r in dr["statuses"] if r.startswith("OK"))
+        n_skip = sum(1 for r in dr["statuses"] if r.startswith("SKIP"))
+        n_err  = len(dr["statuses"]) - n_ok - n_skip
+        sum_parts = []
+        if n_ok:   sum_parts.append(f"**{n_ok} ingested**")
+        if n_skip: sum_parts.append(f"{n_skip} skipped (unchanged)")
+        if n_err:  sum_parts.append(f"**{n_err} failed**")
         st.caption(
-            "Open any previously-confirmed document in the per-page review tool — "
-            "flagged documents (⚠) are listed first."
+            ", ".join(sum_parts)
+            + ". Review extracted intelligence below — edit anything that needs correcting, then click Done."
         )
-        doc_entries = [e for e in get_all_entries() if e.get("entry_type") == "document"]
-        doc_entries.sort(key=lambda e: (not e.get("validation_warning"), e.get("source", "")))
-        if not doc_entries:
-            st.info("No confirmed documents in the library yet.")
-        else:
-            options = {
-                f"{'⚠ ' if e.get('validation_warning') else ''}{e['source']}": e["id"]
-                for e in doc_entries
-            }
-            choice = st.selectbox(
-                "Document", list(options.keys()),
-                key="existing_doc_picker", label_visibility="collapsed",
-            )
-            chosen_id = options[choice]
-            chosen_entry = next(e for e in doc_entries if e["id"] == chosen_id)
-            _render_review_card(chosen_entry)
 
-    # ── Backfill ──────────────────────────────────────────────────────────────
-    st.divider()
-    with st.expander("Backfill missing summaries & topics"):
-        st.caption("Enriches document entries that are missing summary or topic tags.")
-        needs = get_entries_needing_enrichment()
-        if not needs:
-            st.info("All documents already have summaries and topics.")
-        else:
-            st.write(f"**{len(needs)} document(s) need enriching:**")
-            for r in needs: st.write(f"- {r['source']}")
-            if st.button("Backfill now", type="secondary"):
-                prog = st.progress(0); n = len(needs)
-                for i, entry in enumerate(needs):
-                    prog.progress(i/n, text=f"Enriching {entry['source']}…")
-                    with st.status(f"**{entry['source']}**", expanded=False) as s:
-                        try:
-                            path = resolve_source_file(entry)
-                            if path is None:
-                                raise FileNotFoundError(
-                                    f"{entry['source']} not found under {DOCS_DIR}"
-                                )
-                            result = extract_file(path)
-                            meta   = enrich_document(entry["source"], _ft(result))
-                            update_enrichment(entry["id"], summary=meta.get("summary",""), topic_tags=meta.get("topics",""))
-                            index_entry(entry["id"])
-                            s.update(label=f"**{entry['source']}** ✓", state="complete")
-                        except Exception as exc:
-                            s.update(label=f"**{entry['source']}** ✗", state="error")
-                            st.error(str(exc))
-                prog.progress(1.0, text="Done.")
-                st.success("Backfill complete.")
-                st.rerun()
+        # Keyed on filename: uploads land in DOCS_DIR under their own name, and
+        # `source` is that filename (file_path is stored relative to DOCS_DIR).
+        all_e = {
+            e["source"]: e for e in get_all_entries()
+            if e.get("entry_type") == "document"
+        }
+
+        for path_str, result in zip(dr["paths"], dr["statuses"]):
+            fname = Path(path_str).name
+
+            if result.startswith("SKIP"):
+                st.info(f"**⏭  {fname}** — unchanged, skipped", icon=None)
+                continue
+            if not result.startswith("OK"):
+                st.error(f"**✗  {fname}** — {result}")
+                continue
+
+            entry = all_e.get(fname)
+            if not entry:
+                st.warning(f"📄 **{fname}** — processed but entry not found in database")
+                continue
+
+            _render_review_card(entry)
+
+        if st.button("Done reviewing", type="primary", key="doc_review_done"):
+            st.session_state.pop("doc_review", None)
+            st.rerun()
+
+    else:
+        # ── Normal upload form ─────────────────────────────────────────────────
+        st.caption("Files are SHA-256 hashed; unchanged files are skipped automatically.")
+
+        uploaded = st.file_uploader(
+            "Drag files here", type=["pdf","pptx","xlsx","xls"],
+            accept_multiple_files=True, label_visibility="collapsed",
+        )
+        if uploaded:
+            st.write(f"**{len(uploaded)} file(s) ready:**")
+            DOCS_DIR.mkdir(parents=True, exist_ok=True)
+            for uf in uploaded:
+                exists = (DOCS_DIR / uf.name).exists()
+                st.write(f"- {uf.name}{'  _(already exists)_' if exists else ''}")
+
+        if st.button(f"Process {len(uploaded)} file(s)" if uploaded else "Process files",
+                     type="primary", disabled=not uploaded):
+            DOCS_DIR.mkdir(parents=True, exist_ok=True)
+            saved = []
+            for uf in uploaded:
+                dest = DOCS_DIR / uf.name
+                dest.write_bytes(uf.getvalue())
+                saved.append(dest)
+            with st.spinner("Classifying with Claude (parallel batches)…"):
+                results = asyncio.run(ingest_all_async(saved))
+            st.session_state["doc_review"] = {
+                "paths":    [str(p) for p in saved],
+                "statuses": results,
+            }
+            st.rerun()
+
+        # ── Review or correct an existing document ─────────────────────────────────
+        st.divider()
+        with st.expander("🔍 Review or correct an existing document"):
+            st.caption(
+                "Open any previously-ingested document in the same per-page review tool "
+                "shown right after upload — flagged documents (⚠) are listed first."
+            )
+            doc_entries = [e for e in get_all_entries() if e.get("entry_type") == "document"]
+            doc_entries.sort(key=lambda e: (not e.get("validation_warning"), e.get("source", "")))
+            if not doc_entries:
+                st.info("No documents in the library yet.")
+            else:
+                options = {
+                    f"{'⚠ ' if e.get('validation_warning') else ''}{e['source']}": e["id"]
+                    for e in doc_entries
+                }
+                choice = st.selectbox(
+                    "Document", list(options.keys()),
+                    key="existing_doc_picker", label_visibility="collapsed",
+                )
+                chosen_id = options[choice]
+                chosen_entry = next(e for e in doc_entries if e["id"] == chosen_id)
+                _render_review_card(chosen_entry)
+
+        # ── Backfill ──────────────────────────────────────────────────────────────
+        st.divider()
+        with st.expander("Backfill missing summaries & topics"):
+            st.caption("Enriches document entries that are missing summary or topic tags.")
+            needs = get_entries_needing_enrichment()
+            if not needs:
+                st.info("All documents already have summaries and topics.")
+            else:
+                st.write(f"**{len(needs)} document(s) need enriching:**")
+                for r in needs: st.write(f"- {r['source']}")
+                if st.button("Backfill now", type="secondary"):
+                    prog = st.progress(0); n = len(needs)
+                    for i, entry in enumerate(needs):
+                        prog.progress(i/n, text=f"Enriching {entry['source']}…")
+                        with st.status(f"**{entry['source']}**", expanded=False) as s:
+                            try:
+                                path = resolve_source_file(entry)
+                                if path is None:
+                                    raise FileNotFoundError(
+                                        f"{entry['source']} not found under {DOCS_DIR}"
+                                    )
+                                result = extract_file(path)
+                                meta   = enrich_document(entry["source"], _ft(result))
+                                update_enrichment(entry["id"], summary=meta.get("summary",""), topic_tags=meta.get("topics",""))
+                                index_entry(entry["id"])
+                                s.update(label=f"**{entry['source']}** ✓", state="complete")
+                            except Exception as exc:
+                                s.update(label=f"**{entry['source']}** ✗", state="error")
+                                st.error(str(exc))
+                    prog.progress(1.0, text="Done.")
+                    st.success("Backfill complete.")
+                    st.rerun()
 
 # ── Log a Snippet ─────────────────────────────────────────────────────────────
 with tab_log:

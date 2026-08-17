@@ -56,10 +56,6 @@ VALIDATION_MIN_CHUNKS_FOR_ENTITY_CHECK = int(os.getenv("SN1_VALIDATION_MIN_CHUNK
 # entries past this window.
 DELETED_RETENTION_DAYS = int(os.getenv("SN1_DELETED_RETENTION_DAYS", "30"))
 
-# Staged (unconfirmed) ingestion drafts older than this are eligible for a
-# manual purge from Add & Log — nothing is purged automatically.
-DRAFT_RETENTION_DAYS = int(os.getenv("SN1_DRAFT_RETENTION_DAYS", "7"))
-
 # ── Access ────────────────────────────────────────────────────────────────
 SHARE_PASSWORD = os.getenv("SN1_SHARE_PASSWORD", "")
 

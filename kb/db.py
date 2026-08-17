@@ -18,7 +18,6 @@ Soft deletion:
   `deleted_with_entry`, which is what `restore_entry()` uses to put them back.
 """
 
-import json
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -126,43 +125,6 @@ CREATE TABLE IF NOT EXISTS deals (
     deleted_with_entry INTEGER,
     date_added      TEXT    DEFAULT (datetime('now')),
     updated_at      TEXT    DEFAULT (datetime('now'))
-);
-
--- Staged (not-yet-committed) ingestion results. Deliberately a separate table,
--- not a status='draft' flag on `entries`: none of the read paths (Ask,
--- Browse, entity hubs, deals tables, validation counts, the eval set) query
--- this table, so draft data cannot leak into them by construction — there is
--- no filter to forget. A draft holds everything ingestion already computed
--- (chunks/entities/deals as JSON, since they aren't real relational rows
--- until committed) so re-opening a pending draft never re-runs extraction.
--- commit_draft_document() moves a draft into entries/chunks/entry_entities/
--- deals/search_idx in one transaction; discard_draft() hard-deletes it —
--- a draft was never live, so it has no soft-delete/recycle-bin state.
-CREATE TABLE IF NOT EXISTS draft_documents (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    source          TEXT NOT NULL,
-    content_hash    TEXT NOT NULL UNIQUE,
-    file_path       TEXT DEFAULT '',
-    file_type       TEXT DEFAULT '',
-    entry_date      TEXT DEFAULT '',
-    coverage_period TEXT DEFAULT '',
-    doc_type        TEXT DEFAULT '',
-    org_tags        TEXT DEFAULT '',
-    market_tags     TEXT DEFAULT '',
-    sport_tags      TEXT DEFAULT '',
-    topic_tags      TEXT DEFAULT '',
-    summary         TEXT DEFAULT '',
-    notes           TEXT DEFAULT '',
-    is_duplicate    INTEGER DEFAULT 0,
-    ocr_used        INTEGER DEFAULT 0,
-    ingest_error    TEXT DEFAULT '',
-    reliability     TEXT DEFAULT 'reported',
-    validation_warning TEXT DEFAULT '',
-    chunks_json     TEXT DEFAULT '[]',
-    entities_json   TEXT DEFAULT '[]',
-    deals_json      TEXT DEFAULT '[]',
-    created_at      TEXT DEFAULT (datetime('now')),
-    updated_at      TEXT DEFAULT (datetime('now'))
 );
 """
 
@@ -528,65 +490,59 @@ def store_chunks(
 
 # ── FTS index writes ──────────────────────────────────────────────────────────
 
-def _index_entry_on_conn(con, entry_id: int) -> None:
-    """Core logic, run against a caller-supplied connection — see
-    index_entry(). Used by commit_draft_document() so a draft's chunks are
-    indexed in the same transaction that makes them live."""
-    stale_rowids = [
-        r[0] for r in con.execute(
-            "SELECT rowid FROM search_idx_map WHERE entry_id=?", (entry_id,)
-        ).fetchall()
-    ]
-    if stale_rowids:
-        ph = ",".join("?" * len(stale_rowids))
-        con.execute(f"DELETE FROM search_idx WHERE rowid IN ({ph})", stale_rowids)
-        con.execute(f"DELETE FROM search_idx_map WHERE rowid IN ({ph})", stale_rowids)
-
-    entry = con.execute("SELECT * FROM entries WHERE id=?", (entry_id,)).fetchone()
-    if not entry:
-        return
-    entry = dict(entry)
-
-    # Index-level row: summary + all tags concatenated
-    tags_blob = " ".join(filter(None, [
-        entry.get("sport_tags", ""), entry.get("topic_tags", ""),
-        entry.get("org_tags", ""),  entry.get("market_tags", ""),
-        entry.get("doc_type", ""),  entry.get("notes", ""),
-    ]))
-    entry_text = f"{entry.get('summary','')} {tags_blob}".strip()
-    if entry_text:
-        cur = con.execute(
-            "INSERT INTO search_idx (body, source) VALUES (?,?)",
-            (entry_text, entry["source"]),
-        )
-        con.execute(
-            "INSERT INTO search_idx_map (rowid, entry_id) VALUES (?,?)",
-            (cur.lastrowid, entry_id),
-        )
-
-    # Per-chunk rows
-    chunks = con.execute(
-        "SELECT * FROM chunks WHERE entry_id=? ORDER BY chunk_num", (entry_id,)
-    ).fetchall()
-    for chunk in chunks:
-        if chunk["text"].strip():
-            cur = con.execute(
-                "INSERT INTO search_idx (body, source) VALUES (?,?)",
-                (chunk["text"], entry["source"]),
-            )
-            con.execute(
-                "INSERT INTO search_idx_map (rowid, entry_id, chunk_id) VALUES (?,?,?)",
-                (cur.lastrowid, entry_id, chunk["id"]),
-            )
-
-
 def index_entry(entry_id: int, path: Path = DB_PATH) -> None:
     """
     (Re-)index an entry in search_idx.
     Indexes: per-chunk text rows + one entry-level row (summary + tags).
     """
     with _conn(path) as con:
-        _index_entry_on_conn(con, entry_id)
+        # Remove stale index rows for this entry
+        stale_rowids = [
+            r[0] for r in con.execute(
+                "SELECT rowid FROM search_idx_map WHERE entry_id=?", (entry_id,)
+            ).fetchall()
+        ]
+        if stale_rowids:
+            ph = ",".join("?" * len(stale_rowids))
+            con.execute(f"DELETE FROM search_idx WHERE rowid IN ({ph})", stale_rowids)
+            con.execute(f"DELETE FROM search_idx_map WHERE rowid IN ({ph})", stale_rowids)
+
+        entry = con.execute("SELECT * FROM entries WHERE id=?", (entry_id,)).fetchone()
+        if not entry:
+            return
+        entry = dict(entry)
+
+        # Index-level row: summary + all tags concatenated
+        tags_blob = " ".join(filter(None, [
+            entry.get("sport_tags", ""), entry.get("topic_tags", ""),
+            entry.get("org_tags", ""),  entry.get("market_tags", ""),
+            entry.get("doc_type", ""),  entry.get("notes", ""),
+        ]))
+        entry_text = f"{entry.get('summary','')} {tags_blob}".strip()
+        if entry_text:
+            cur = con.execute(
+                "INSERT INTO search_idx (body, source) VALUES (?,?)",
+                (entry_text, entry["source"]),
+            )
+            con.execute(
+                "INSERT INTO search_idx_map (rowid, entry_id) VALUES (?,?)",
+                (cur.lastrowid, entry_id),
+            )
+
+        # Per-chunk rows
+        chunks = con.execute(
+            "SELECT * FROM chunks WHERE entry_id=? ORDER BY chunk_num", (entry_id,)
+        ).fetchall()
+        for chunk in chunks:
+            if chunk["text"].strip():
+                cur = con.execute(
+                    "INSERT INTO search_idx (body, source) VALUES (?,?)",
+                    (chunk["text"], entry["source"]),
+                )
+                con.execute(
+                    "INSERT INTO search_idx_map (rowid, entry_id, chunk_id) VALUES (?,?,?)",
+                    (cur.lastrowid, entry_id, chunk["id"]),
+                )
 
 
 # ── Stats ────────────────────────────────────────────────────────────────────
@@ -651,56 +607,30 @@ def upsert_entity(
         return cur.lastrowid
 
 
-def _find_entity_on_conn(con, name: str, include_deleted: bool = False) -> Optional[dict]:
-    """Core lookup, run against a caller-supplied connection — see
-    find_entity_by_name_or_alias(). Used directly (not via the path-opening
-    wrapper) by code that must see writes made earlier in the same
-    transaction, e.g. commit_draft_document()."""
-    name_lo = name.strip().lower()
-    del_filter = "" if include_deleted else " AND deleted_at IS NULL"
-    row = con.execute(
-        f"SELECT * FROM entities WHERE LOWER(canonical_name)=?{del_filter}", (name_lo,)
-    ).fetchone()
-    if row:
-        return dict(row)
-    rows = con.execute(
-        f"SELECT * FROM entities WHERE 1=1{del_filter}"
-    ).fetchall()
-    for r in rows:
-        aliases = [a.strip().lower() for a in (r["aliases"] or "").split(",") if a.strip()]
-        if name_lo in aliases:
-            return dict(r)
-    return None
-
-
 def find_entity_by_name_or_alias(
     name: str,
     include_deleted: bool = False,
     path: Path = DB_PATH,
 ) -> Optional[dict]:
     """Return the entity row whose canonical_name or any alias matches `name` (case-insensitive)."""
+    name_lo = name.strip().lower()
+    del_filter = "" if include_deleted else " AND deleted_at IS NULL"
     with _conn(path) as con:
-        return _find_entity_on_conn(con, name, include_deleted)
-
-
-def _find_or_create_entity_on_conn(con, canonical_name: str, entity_type: str = "other", proposed: bool = False) -> int:
-    """Core logic, run against a caller-supplied connection — see
-    find_or_create_entity(). Used by commit_draft_document() so newly-created
-    entities are visible to later lookups within the same transaction."""
-    existing = _find_entity_on_conn(con, canonical_name, include_deleted=True)
-    if existing:
-        if existing.get("deleted_at"):
-            con.execute(
-                "UPDATE entities SET deleted_at=NULL, deleted_with_entry=NULL,"
-                " updated_at=datetime('now') WHERE id=?",
-                (existing["id"],),
-            )
-        return existing["id"]
-    cur = con.execute(
-        "INSERT INTO entities (canonical_name, entity_type, aliases, is_proposed) VALUES (?,?,?,?)",
-        (canonical_name, entity_type, "", int(proposed)),
-    )
-    return cur.lastrowid
+        # Exact canonical match
+        row = con.execute(
+            f"SELECT * FROM entities WHERE LOWER(canonical_name)=?{del_filter}", (name_lo,)
+        ).fetchone()
+        if row:
+            return dict(row)
+        # Alias scan (comma-separated aliases column)
+        rows = con.execute(
+            f"SELECT * FROM entities WHERE 1=1{del_filter}"
+        ).fetchall()
+        for r in rows:
+            aliases = [a.strip().lower() for a in (r["aliases"] or "").split(",") if a.strip()]
+            if name_lo in aliases:
+                return dict(r)
+    return None
 
 
 def find_or_create_entity(
@@ -713,8 +643,12 @@ def find_or_create_entity(
     Find entity by name/alias; create (optionally as proposed) if not found.
     A soft-deleted match is revived — a new source mentioning it brings it back.
     """
-    with _conn(path) as con:
-        return _find_or_create_entity_on_conn(con, canonical_name, entity_type, proposed)
+    existing = find_entity_by_name_or_alias(canonical_name, include_deleted=True, path=path)
+    if existing:
+        if existing.get("deleted_at"):
+            update_entity(existing["id"], path=path, deleted_at=None, deleted_with_entry=None)
+        return existing["id"]
+    return upsert_entity(canonical_name, entity_type, "", int(proposed), path)
 
 
 def get_all_entities(
@@ -762,13 +696,6 @@ def merge_entities(keep_id: int, discard_id: int, path: Path = DB_PATH) -> None:
 
 # ── Entry ↔ Entity links ──────────────────────────────────────────────────────
 
-def _link_entry_to_entity_on_conn(con, entry_id: int, entity_id: int, role: str = "secondary") -> None:
-    con.execute(
-        "INSERT OR REPLACE INTO entry_entities (entry_id, entity_id, role) VALUES (?,?,?)",
-        (entry_id, entity_id, role),
-    )
-
-
 def link_entry_to_entity(
     entry_id: int,
     entity_id: int,
@@ -776,7 +703,10 @@ def link_entry_to_entity(
     path: Path = DB_PATH,
 ) -> None:
     with _conn(path) as con:
-        _link_entry_to_entity_on_conn(con, entry_id, entity_id, role)
+        con.execute(
+            "INSERT OR REPLACE INTO entry_entities (entry_id, entity_id, role) VALUES (?,?,?)",
+            (entry_id, entity_id, role),
+        )
 
 
 def get_entities_for_entry(entry_id: int, path: Path = DB_PATH) -> list[dict]:
@@ -886,16 +816,6 @@ def get_proposed_entities(path: Path = DB_PATH) -> list[dict]:
 
 # ── Deals CRUD ────────────────────────────────────────────────────────────────
 
-def _normalize_deal_party_on_conn(con, name: str) -> str:
-    """Core logic, run against a caller-supplied connection — see
-    _normalize_deal_party()."""
-    name = (name or "").strip()
-    if not name:
-        return name
-    row = _find_entity_on_conn(con, name)
-    return row["canonical_name"] if row else name
-
-
 def _normalize_deal_party(name: str, path: Path = DB_PATH) -> str:
     """
     Resolve a raw broadcaster/territory string to its canonical entity name
@@ -904,8 +824,11 @@ def _normalize_deal_party(name: str, path: Path = DB_PATH) -> str:
     three separate deal rows. Returns the trimmed input unchanged when no
     entity matches — not every broadcaster/territory needs to be seeded.
     """
-    with _conn(path) as con:
-        return _normalize_deal_party_on_conn(con, name)
+    name = (name or "").strip()
+    if not name:
+        return name
+    row = find_entity_by_name_or_alias(name, path=path)
+    return row["canonical_name"] if row else name
 
 
 _FULL_YEAR_RE = re.compile(r"(\d{4})")
@@ -953,95 +876,6 @@ _DEAL_FILLABLE_FIELDS = [
 ]
 
 
-def _write_deal_on_conn(
-    con,
-    entity_id: int,
-    territory: str = "",
-    broadcaster: str = "",
-    rights_holder: str = "",
-    value: Optional[float] = None,
-    currency: str = "",
-    value_note: str = "",
-    period_start: str = "",
-    period_end: str = "",
-    platform: str = "",
-    source_entry_id: Optional[int] = None,
-    source_note: str = "",
-    status: str = "current",
-    reliability: str = "reported",
-) -> int:
-    """Core logic, run against a caller-supplied connection — see add_deal().
-    Used directly by commit_draft_document() so every deal in a draft is
-    normalized/deduped/written in the same transaction as the entry it
-    belongs to."""
-    territory   = _normalize_deal_party_on_conn(con, territory)
-    broadcaster = _normalize_deal_party_on_conn(con, broadcaster)
-    rights_holder = (rights_holder or "").strip()
-    value_note    = (value_note or "").strip()
-    platform      = (platform or "").strip()
-    source_note   = (source_note or "").strip()
-    currency      = (currency or "").strip()
-    period_start  = (period_start or "").strip()
-    period_end    = (period_end or "").strip()
-
-    flagged = ""
-    if value is not None and value != 0 and not currency:
-        flagged = (
-            f"Value stated without currency ({value}"
-            f"{(' ' + value_note) if value_note else ''}) — needs manual currency confirmation."
-        )
-        value_note = f"[unconfirmed currency: {value}] {value_note}".strip()
-        value = None
-
-    status = _infer_deal_status(period_end, status)
-
-    existing = con.execute("""
-        SELECT * FROM deals
-        WHERE entity_id=?
-          AND deleted_at IS NULL
-          AND LOWER(TRIM(territory))=LOWER(TRIM(?))
-          AND LOWER(TRIM(broadcaster))=LOWER(TRIM(?))
-          AND TRIM(period_start)=TRIM(?)
-          AND TRIM(period_end)=TRIM(?)
-    """, (entity_id, territory, broadcaster, period_start, period_end)).fetchone()
-
-    if existing:
-        candidates = dict(
-            rights_holder=rights_holder, value=value, currency=currency,
-            value_note=value_note, platform=platform,
-            source_entry_id=source_entry_id, source_note=source_note,
-            flagged_for_review=flagged,
-        )
-        fills = {
-            field: new_val
-            for field, new_val in candidates.items()
-            if existing[field] in (None, "") and new_val not in (None, "")
-        }
-        if status == "superseded" and existing["status"] != "superseded":
-            fills["status"] = status
-        if fills:
-            con.execute(
-                f"UPDATE deals SET {', '.join(f'{f}=?' for f in fills)}, "
-                f"updated_at=datetime('now') WHERE id=?",
-                list(fills.values()) + [existing["id"]],
-            )
-        return existing["id"]
-
-    cur = con.execute("""
-        INSERT INTO deals
-            (entity_id, territory, broadcaster, rights_holder, value, currency,
-             value_note, period_start, period_end, platform,
-             source_entry_id, source_note, status, reliability, flagged_for_review)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        entity_id, territory, broadcaster, rights_holder,
-        value, currency, value_note,
-        period_start, period_end, platform,
-        source_entry_id, source_note, status, reliability, flagged,
-    ))
-    return cur.lastrowid
-
-
 def add_deal(
     entity_id: int,
     territory: str = "",
@@ -1075,12 +909,73 @@ def add_deal(
     flagged for review. Status is inferred from period_end (see
     _infer_deal_status) — a clearly past period is always 'superseded'.
     """
-    with _conn(path) as con:
-        return _write_deal_on_conn(
-            con, entity_id, territory, broadcaster, rights_holder, value,
-            currency, value_note, period_start, period_end, platform,
-            source_entry_id, source_note, status, reliability,
+    territory   = _normalize_deal_party(territory, path=path)
+    broadcaster = _normalize_deal_party(broadcaster, path=path)
+    rights_holder = (rights_holder or "").strip()
+    value_note    = (value_note or "").strip()
+    platform      = (platform or "").strip()
+    source_note   = (source_note or "").strip()
+    currency      = (currency or "").strip()
+    period_start  = (period_start or "").strip()
+    period_end    = (period_end or "").strip()
+
+    flagged = ""
+    if value is not None and value != 0 and not currency:
+        flagged = (
+            f"Value stated without currency ({value}"
+            f"{(' ' + value_note) if value_note else ''}) — needs manual currency confirmation."
         )
+        value_note = f"[unconfirmed currency: {value}] {value_note}".strip()
+        value = None
+
+    status = _infer_deal_status(period_end, status)
+
+    with _conn(path) as con:
+        existing = con.execute("""
+            SELECT * FROM deals
+            WHERE entity_id=?
+              AND deleted_at IS NULL
+              AND LOWER(TRIM(territory))=LOWER(TRIM(?))
+              AND LOWER(TRIM(broadcaster))=LOWER(TRIM(?))
+              AND TRIM(period_start)=TRIM(?)
+              AND TRIM(period_end)=TRIM(?)
+        """, (entity_id, territory, broadcaster, period_start, period_end)).fetchone()
+
+        if existing:
+            candidates = dict(
+                rights_holder=rights_holder, value=value, currency=currency,
+                value_note=value_note, platform=platform,
+                source_entry_id=source_entry_id, source_note=source_note,
+                flagged_for_review=flagged,
+            )
+            fills = {
+                field: new_val
+                for field, new_val in candidates.items()
+                if existing[field] in (None, "") and new_val not in (None, "")
+            }
+            if status == "superseded" and existing["status"] != "superseded":
+                fills["status"] = status
+            if fills:
+                con.execute(
+                    f"UPDATE deals SET {', '.join(f'{f}=?' for f in fills)}, "
+                    f"updated_at=datetime('now') WHERE id=?",
+                    list(fills.values()) + [existing["id"]],
+                )
+            return existing["id"]
+
+        cur = con.execute("""
+            INSERT INTO deals
+                (entity_id, territory, broadcaster, rights_holder, value, currency,
+                 value_note, period_start, period_end, platform,
+                 source_entry_id, source_note, status, reliability, flagged_for_review)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            entity_id, territory, broadcaster, rights_holder,
+            value, currency, value_note,
+            period_start, period_end, platform,
+            source_entry_id, source_note, status, reliability, flagged,
+        ))
+        return cur.lastrowid
 
 
 def flag_deals_missing_currency(dry_run: bool = True, path: Path = DB_PATH) -> list[dict]:
@@ -1514,216 +1409,3 @@ def purge_expired_deleted(retention_days: int, path: Path = DB_PATH) -> int:
     """Permanently purge every soft-deleted entry past the retention window."""
     ids = get_purgeable_entry_ids(retention_days, path)
     return sum(1 for eid in ids if purge_entry(eid, path))
-
-
-# ── Draft documents (staged, not-yet-committed ingestion) ────────────────────
-#
-# See the draft_documents DDL comment for why this is a separate table rather
-# than a status flag on `entries`. The lifecycle:
-#   stage_draft_document()   — ingestion writes its result here, nothing else
-#   get_all_drafts() / get_draft() — list/inspect pending drafts
-#   commit_draft_document()  — atomically moves one draft into the live schema
-#   discard_draft()          — hard-deletes a draft (it was never live)
-#   purge_expired_drafts()   — hard-deletes drafts older than N days
-
-def draft_exists(content_hash: str, path: Path = DB_PATH) -> Optional[int]:
-    """Return the id of an existing draft for this content hash, if any —
-    so re-uploading the same not-yet-confirmed file reuses it instead of
-    re-running extraction or creating a second draft."""
-    if not content_hash:
-        return None
-    with _conn(path) as con:
-        row = con.execute(
-            "SELECT id FROM draft_documents WHERE content_hash=?", (content_hash,)
-        ).fetchone()
-        return row["id"] if row else None
-
-
-def stage_draft_document(payload: dict, path: Path = DB_PATH) -> int:
-    """
-    Persist a fully-computed ingestion result (extraction + classification +
-    entity resolution + deal extraction already run) as a draft, without
-    touching entries/chunks/entry_entities/deals. `payload` keys match the
-    draft_documents columns plus chunks/entities/deals (lists of dicts, JSON-
-    encoded here). Upserts on content_hash so re-staging the same file
-    refreshes the one draft rather than creating a duplicate.
-    """
-    with _conn(path) as con:
-        cur = con.execute("""
-            INSERT INTO draft_documents
-                (source, content_hash, file_path, file_type, entry_date, coverage_period,
-                 doc_type, org_tags, market_tags, sport_tags, topic_tags, summary, notes,
-                 is_duplicate, ocr_used, ingest_error, reliability, validation_warning,
-                 chunks_json, entities_json, deals_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(content_hash) DO UPDATE SET
-                source=excluded.source, file_path=excluded.file_path,
-                file_type=excluded.file_type, entry_date=excluded.entry_date,
-                coverage_period=excluded.coverage_period, doc_type=excluded.doc_type,
-                org_tags=excluded.org_tags, market_tags=excluded.market_tags,
-                sport_tags=excluded.sport_tags, topic_tags=excluded.topic_tags,
-                summary=excluded.summary, notes=excluded.notes,
-                is_duplicate=excluded.is_duplicate, ocr_used=excluded.ocr_used,
-                ingest_error=excluded.ingest_error, reliability=excluded.reliability,
-                validation_warning=excluded.validation_warning,
-                chunks_json=excluded.chunks_json, entities_json=excluded.entities_json,
-                deals_json=excluded.deals_json, updated_at=datetime('now')
-        """, (
-            payload.get("source", ""), payload["content_hash"], payload.get("file_path", ""),
-            payload.get("file_type", ""), payload.get("entry_date", ""), payload.get("coverage_period", ""),
-            payload.get("doc_type", ""), payload.get("org_tags", ""), payload.get("market_tags", ""),
-            payload.get("sport_tags", ""), payload.get("topic_tags", ""), payload.get("summary", ""),
-            payload.get("notes", ""), int(payload.get("is_duplicate", 0)), int(payload.get("ocr_used", 0)),
-            payload.get("ingest_error", ""), payload.get("reliability", "reported"),
-            payload.get("validation_warning", ""),
-            json.dumps(payload.get("chunks", [])), json.dumps(payload.get("entities", [])),
-            json.dumps(payload.get("deals", [])),
-        ))
-        if cur.lastrowid:
-            return cur.lastrowid
-        return con.execute(
-            "SELECT id FROM draft_documents WHERE content_hash=?", (payload["content_hash"],)
-        ).fetchone()["id"]
-
-
-def get_all_drafts(path: Path = DB_PATH) -> list[dict]:
-    """All pending drafts, newest first, with chunks/entities/deals parsed
-    back out of JSON and an `age_days` field for the UI's abandonment list."""
-    with _conn(path) as con:
-        rows = con.execute(
-            "SELECT *, CAST(julianday('now') - julianday(created_at) AS INTEGER) AS age_days "
-            "FROM draft_documents ORDER BY created_at DESC"
-        ).fetchall()
-    out = []
-    for r in rows:
-        d = dict(r)
-        d["chunks"]   = json.loads(d.pop("chunks_json") or "[]")
-        d["entities"] = json.loads(d.pop("entities_json") or "[]")
-        d["deals"]    = json.loads(d.pop("deals_json") or "[]")
-        out.append(d)
-    return out
-
-
-def get_draft(draft_id: int, path: Path = DB_PATH) -> Optional[dict]:
-    """One draft by id, in the same parsed shape as get_all_drafts()."""
-    with _conn(path) as con:
-        row = con.execute("SELECT * FROM draft_documents WHERE id=?", (draft_id,)).fetchone()
-    if not row:
-        return None
-    d = dict(row)
-    d["chunks"]   = json.loads(d.pop("chunks_json") or "[]")
-    d["entities"] = json.loads(d.pop("entities_json") or "[]")
-    d["deals"]    = json.loads(d.pop("deals_json") or "[]")
-    return d
-
-
-def discard_draft(draft_id: int, path: Path = DB_PATH) -> bool:
-    """Hard-delete a draft. It was never live, so unlike every other delete
-    in this app there is no soft-delete/recycle-bin step — nothing to
-    recover, nothing to clutter."""
-    with _conn(path) as con:
-        cur = con.execute("DELETE FROM draft_documents WHERE id=?", (draft_id,))
-        return cur.rowcount > 0
-
-
-def purge_expired_drafts(retention_days: int, path: Path = DB_PATH) -> int:
-    """Hard-delete drafts older than retention_days. Manual, like every other
-    purge in this app — nothing runs automatically."""
-    with _conn(path) as con:
-        cur = con.execute(
-            "DELETE FROM draft_documents WHERE julianday('now') - julianday(created_at) >= ?",
-            (retention_days,),
-        )
-        return cur.rowcount
-
-
-def commit_draft_document(draft_id: int, path: Path = DB_PATH) -> Optional[int]:
-    """
-    Atomically move a draft into the live schema: one entries row, its
-    chunks, FTS index rows, entity links (creating any new proposed entities),
-    and deal rows — all in a single transaction via one connection. Nothing
-    here calls the path-opening wrappers (add_deal(), index_entry(), etc.) —
-    each of those commits its own transaction, which would make a failure
-    partway through leave some of the document live and some not. Everything
-    below runs against one `con` and either all of it commits (via _conn's
-    normal exit) or none of it does (via _conn's rollback-on-exception).
-
-    Returns the new entry id, or None if the draft doesn't exist. If a live
-    entry already exists for this content hash (e.g. the draft was somehow
-    committed twice, or the same file was separately ingested directly), the
-    stale draft is discarded and the existing entry's id is returned rather
-    than creating a duplicate document.
-    """
-    with _conn(path) as con:
-        draft = con.execute("SELECT * FROM draft_documents WHERE id=?", (draft_id,)).fetchone()
-        if not draft:
-            return None
-        draft = dict(draft)
-
-        existing_live = con.execute(
-            "SELECT id FROM entries WHERE content_hash=? AND entry_type='document'",
-            (draft["content_hash"],),
-        ).fetchone()
-        if existing_live:
-            con.execute("DELETE FROM draft_documents WHERE id=?", (draft_id,))
-            return existing_live["id"]
-
-        chunks   = json.loads(draft["chunks_json"] or "[]")
-        entities = json.loads(draft["entities_json"] or "[]")
-        deals    = json.loads(draft["deals_json"] or "[]")
-
-        cur = con.execute("""
-            INSERT INTO entries
-                (entry_type, source, entry_date, coverage_period, file_type, doc_type,
-                 org_tags, market_tags, sport_tags, topic_tags, summary, notes,
-                 file_path, content_hash, is_duplicate, ocr_used, ingest_error,
-                 status, reliability, validation_warning)
-            VALUES ('document',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            draft["source"], draft["entry_date"], draft["coverage_period"],
-            draft["file_type"], draft["doc_type"], draft["org_tags"], draft["market_tags"],
-            draft["sport_tags"], draft["topic_tags"], draft["summary"], draft["notes"],
-            draft["file_path"], draft["content_hash"], draft["is_duplicate"],
-            draft["ocr_used"], draft["ingest_error"], "current", draft["reliability"],
-            draft["validation_warning"],
-        ))
-        entry_id = cur.lastrowid
-
-        chunk_ids_by_num = {}
-        for c in chunks:
-            ccur = con.execute(
-                "INSERT INTO chunks (entry_id, chunk_num, chunk_type, text) VALUES (?,?,?,?)",
-                (entry_id, c["chunk_num"], c["chunk_type"], c["text"]),
-            )
-            chunk_ids_by_num[c["chunk_num"]] = ccur.lastrowid
-
-        _index_entry_on_conn(con, entry_id)
-
-        for r in entities:
-            canonical = (r.get("canonical") or "").strip()
-            if not canonical:
-                continue
-            entity_id = _find_or_create_entity_on_conn(
-                con, canonical, r.get("type", "other"), bool(r.get("is_new", False)),
-            )
-            _link_entry_to_entity_on_conn(con, entry_id, entity_id, r.get("role", "secondary"))
-
-        for d in deals:
-            en = (d.get("entity_name") or "").strip()
-            entity_row = _find_entity_on_conn(con, en) if en else None
-            if not entity_row:
-                continue
-            confidence  = d.get("confidence", "medium")
-            deal_status = "unverified" if confidence == "low" else "current"
-            _write_deal_on_conn(
-                con, entity_id=entity_row["id"], territory=d.get("territory", ""),
-                broadcaster=d.get("broadcaster", ""), rights_holder=d.get("rights_holder", ""),
-                value=d.get("value"), currency=d.get("currency", ""),
-                value_note=d.get("value_note", ""), period_start=d.get("period_start", ""),
-                period_end=d.get("period_end", ""), platform=d.get("platform", ""),
-                source_entry_id=entry_id, source_note=draft["source"],
-                status=deal_status, reliability=draft["reliability"],
-            )
-
-        con.execute("DELETE FROM draft_documents WHERE id=?", (draft_id,))
-        return entry_id
