@@ -104,6 +104,13 @@ CREATE TABLE IF NOT EXISTS search_idx_map (
     chunk_id INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS deal_entities (
+    deal_id   INTEGER NOT NULL REFERENCES deals(id)    ON DELETE CASCADE,
+    entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    role      TEXT    NOT NULL DEFAULT 'market',   -- 'property' | 'market' | 'broadcaster'
+    PRIMARY KEY (deal_id, entity_id, role)
+);
+
 CREATE TABLE IF NOT EXISTS deals (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_id       INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
@@ -201,6 +208,16 @@ def init_db(path: Path = DB_PATH) -> None:
         # value with no currency)
         if "flagged_for_review" not in d_cols:
             con.execute("ALTER TABLE deals ADD COLUMN flagged_for_review TEXT DEFAULT ''")
+        # Live migration: backfill deal_entities from deals.entity_id (role='property').
+        # Lossless 1:1 copy, safe to re-run every startup — INSERT OR IGNORE is a
+        # no-op once a deal's property link already exists. deals.entity_id is
+        # intentionally left in place (not dropped) so nothing depends solely on
+        # this table being fully populated yet; see backfill_deal_entities.py for
+        # the separate (dry-run-first) market/broadcaster backfill.
+        con.execute("""
+            INSERT OR IGNORE INTO deal_entities (deal_id, entity_id, role)
+            SELECT id, entity_id, 'property' FROM deals WHERE entity_id IS NOT NULL
+        """)
 
 
 # ── Entry reads ─────────────────────────────────────────────────────────────
@@ -610,21 +627,31 @@ def upsert_entity(
 def find_entity_by_name_or_alias(
     name: str,
     include_deleted: bool = False,
+    entity_type: Optional[str] = None,
     path: Path = DB_PATH,
 ) -> Optional[dict]:
-    """Return the entity row whose canonical_name or any alias matches `name` (case-insensitive)."""
+    """
+    Return the entity row whose canonical_name or any alias matches `name`
+    (case-insensitive). Pass entity_type to restrict the match to one type
+    (e.g. 'market') — needed when resolving a deal's territory/broadcaster
+    fragment, where an unqualified name could otherwise coincidentally match
+    an entity of the wrong kind.
+    """
     name_lo = name.strip().lower()
     del_filter = "" if include_deleted else " AND deleted_at IS NULL"
+    type_filter = " AND entity_type=?" if entity_type else ""
+    type_args = [entity_type] if entity_type else []
     with _conn(path) as con:
         # Exact canonical match
         row = con.execute(
-            f"SELECT * FROM entities WHERE LOWER(canonical_name)=?{del_filter}", (name_lo,)
+            f"SELECT * FROM entities WHERE LOWER(canonical_name)=?{del_filter}{type_filter}",
+            [name_lo] + type_args,
         ).fetchone()
         if row:
             return dict(row)
         # Alias scan (comma-separated aliases column)
         rows = con.execute(
-            f"SELECT * FROM entities WHERE 1=1{del_filter}"
+            f"SELECT * FROM entities WHERE 1=1{del_filter}{type_filter}", type_args
         ).fetchall()
         for r in rows:
             aliases = [a.strip().lower() for a in (r["aliases"] or "").split(",") if a.strip()]
@@ -875,6 +902,55 @@ _DEAL_FILLABLE_FIELDS = [
     "source_entry_id", "source_note", "flagged_for_review",
 ]
 
+_MULTI_VALUE_RE = re.compile(r"[;/,]")
+
+
+def split_multi_value(s: str) -> list[str]:
+    """Split a compound territory/broadcaster string ('Turkey, Ukraine',
+    'Nine/Stan Sport') into its parts, so each can be resolved and linked to
+    its own entity instead of the whole row only ever matching one."""
+    return [p.strip() for p in _MULTI_VALUE_RE.split(s or "") if p.strip()]
+
+
+def resolve_entity_ids(parts: list[str], entity_type: str, path: Path = DB_PATH) -> list[int]:
+    """Resolve each part to an entity of the given type; sorted, deduped, unresolved parts skipped."""
+    ids = set()
+    for part in parts:
+        row = find_entity_by_name_or_alias(part, entity_type=entity_type, path=path)
+        if row:
+            ids.add(row["id"])
+    return sorted(ids)
+
+
+def link_deal_to_entity(deal_id: int, entity_id: int, role: str, path: Path = DB_PATH) -> None:
+    with _conn(path) as con:
+        con.execute(
+            "INSERT OR IGNORE INTO deal_entities (deal_id, entity_id, role) VALUES (?,?,?)",
+            (deal_id, entity_id, role),
+        )
+
+
+def _link_deal_to_entity_on_conn(con, deal_id: int, entity_id: int, role: str) -> None:
+    con.execute(
+        "INSERT OR IGNORE INTO deal_entities (deal_id, entity_id, role) VALUES (?,?,?)",
+        (deal_id, entity_id, role),
+    )
+
+
+def get_entities_for_deal(deal_id: int, role: Optional[str] = None, path: Path = DB_PATH) -> list[dict]:
+    with _conn(path) as con:
+        q = """
+            SELECT e.*, de.role AS link_role FROM entities e
+            JOIN deal_entities de ON de.entity_id = e.id
+            WHERE de.deal_id = ? AND e.deleted_at IS NULL
+        """
+        params: list = [deal_id]
+        if role:
+            q += " AND de.role = ?"
+            params.append(role)
+        rows = con.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
 
 def add_deal(
     entity_id: int,
@@ -895,14 +971,34 @@ def add_deal(
 ) -> int:
     """
     Insert a deal row, or fill gaps on a matching existing one instead of
-    duplicating it.
+    duplicating it. Also links the deal to every entity it touches via
+    deal_entities — the property (entity_id, role='property'), and every
+    market/broadcaster the territory/broadcaster fields resolve to
+    (role='market'/'broadcaster') — so the deal is findable from its
+    property's page AND every market/broadcaster page it covers, not just
+    entity_id's page. Compound fields ("Turkey, Ukraine", "Nine/Stan Sport")
+    are split on ; / , first so a multi-territory row links to every market
+    it names (see split_multi_value), rather than the whole row only ever
+    matching one.
 
-    Territory and broadcaster are normalized to their canonical entity name
-    first (see _normalize_deal_party), then a match is looked for on
-    (entity_id, normalized territory, normalized broadcaster, period_start,
-    period_end). A match updates only the currently-blank fields on the
-    existing row — it never overwrites data already there — and returns the
-    existing id instead of inserting a duplicate.
+    Match key: (entity_id, period_start, period_end) narrows candidates, then
+    each candidate's linked market/broadcaster entity-id sets are compared
+    against this call's resolved sets. When BOTH sides have at least one
+    resolved entity, the sets must match exactly. When either side has none
+    (nothing resolved — not every territory/broadcaster string is a seeded
+    entity, and pre-migration rows may not have deal_entities links yet),
+    matching falls back to the plain normalized string comparison this
+    function used before deal_entities existed. This fallback matters: an
+    empty set is not itself a meaningful match key, and comparing two empty
+    sets as "equal" would silently merge two genuinely different unresolved
+    territories/broadcasters (e.g. "DACH" and "Nordics", neither seeded) just
+    because neither resolved to anything. A residual, accepted risk on the
+    other side: a PARTIALLY-resolved compound value (only one of two parts
+    matches a seeded entity) still uses set comparison, so a row with one
+    resolved id can fail to match a row with two even when they describe the
+    same deal — this trades a possible near-duplicate (recoverable via the
+    run_deal_dedupe() hygiene pass) for avoiding a false merge, consistent
+    with this app's "flag for review" bias over silent guessing elsewhere.
 
     A value with no currency is never stored as a bare number: it's set to
     null, the original figure is preserved in value_note, and the row is
@@ -930,19 +1026,48 @@ def add_deal(
 
     status = _infer_deal_status(period_end, status)
 
+    market_ids      = resolve_entity_ids(split_multi_value(territory), "market", path=path)
+    broadcaster_ids = resolve_entity_ids(split_multi_value(broadcaster), "broadcaster", path=path)
+
+    def _norm(s: Optional[str]) -> str:
+        return (s or "").strip().lower()
+
     with _conn(path) as con:
-        existing = con.execute("""
+        candidates = con.execute("""
             SELECT * FROM deals
             WHERE entity_id=?
               AND deleted_at IS NULL
-              AND LOWER(TRIM(territory))=LOWER(TRIM(?))
-              AND LOWER(TRIM(broadcaster))=LOWER(TRIM(?))
               AND TRIM(period_start)=TRIM(?)
               AND TRIM(period_end)=TRIM(?)
-        """, (entity_id, territory, broadcaster, period_start, period_end)).fetchone()
+        """, (entity_id, period_start, period_end)).fetchall()
+
+        existing = None
+        for cand in candidates:
+            cand_markets = [r["entity_id"] for r in con.execute(
+                "SELECT entity_id FROM deal_entities WHERE deal_id=? AND role='market' ORDER BY entity_id",
+                (cand["id"],),
+            ).fetchall()]
+            cand_broadcasters = [r["entity_id"] for r in con.execute(
+                "SELECT entity_id FROM deal_entities WHERE deal_id=? AND role='broadcaster' ORDER BY entity_id",
+                (cand["id"],),
+            ).fetchall()]
+
+            if market_ids and cand_markets:
+                market_match = market_ids == cand_markets
+            else:
+                market_match = _norm(cand["territory"]) == _norm(territory)
+
+            if broadcaster_ids and cand_broadcasters:
+                broadcaster_match = broadcaster_ids == cand_broadcasters
+            else:
+                broadcaster_match = _norm(cand["broadcaster"]) == _norm(broadcaster)
+
+            if market_match and broadcaster_match:
+                existing = cand
+                break
 
         if existing:
-            candidates = dict(
+            fillable = dict(
                 rights_holder=rights_holder, value=value, currency=currency,
                 value_note=value_note, platform=platform,
                 source_entry_id=source_entry_id, source_note=source_note,
@@ -950,7 +1075,7 @@ def add_deal(
             )
             fills = {
                 field: new_val
-                for field, new_val in candidates.items()
+                for field, new_val in fillable.items()
                 if existing[field] in (None, "") and new_val not in (None, "")
             }
             if status == "superseded" and existing["status"] != "superseded":
@@ -961,6 +1086,15 @@ def add_deal(
                     f"updated_at=datetime('now') WHERE id=?",
                     list(fills.values()) + [existing["id"]],
                 )
+            # Always ensure links exist, even on a pure no-op merge — an
+            # existing row may predate deal_entities entirely (pre-migration)
+            # or may have matched via the string fallback above, in which case
+            # this call's freshly-resolved ids still need attaching.
+            _link_deal_to_entity_on_conn(con, existing["id"], entity_id, "property")
+            for mid in market_ids:
+                _link_deal_to_entity_on_conn(con, existing["id"], mid, "market")
+            for bid in broadcaster_ids:
+                _link_deal_to_entity_on_conn(con, existing["id"], bid, "broadcaster")
             return existing["id"]
 
         cur = con.execute("""
@@ -975,7 +1109,13 @@ def add_deal(
             period_start, period_end, platform,
             source_entry_id, source_note, status, reliability, flagged,
         ))
-        return cur.lastrowid
+        new_id = cur.lastrowid
+        _link_deal_to_entity_on_conn(con, new_id, entity_id, "property")
+        for mid in market_ids:
+            _link_deal_to_entity_on_conn(con, new_id, mid, "market")
+        for bid in broadcaster_ids:
+            _link_deal_to_entity_on_conn(con, new_id, bid, "broadcaster")
+        return new_id
 
 
 def flag_deals_missing_currency(dry_run: bool = True, path: Path = DB_PATH) -> list[dict]:
@@ -1020,12 +1160,17 @@ def flag_deals_missing_currency(dry_run: bool = True, path: Path = DB_PATH) -> l
 def run_deal_dedupe(dry_run: bool = True, path: Path = DB_PATH) -> list[dict]:
     """
     One-off pass over every existing (non-deleted) deal row — for duplicates
-    created before add_deal() normalized/deduped on write. Groups on the same
-    key add_deal() uses (entity_id, normalized territory, normalized
-    broadcaster, period_start, period_end); within a group the row with the
-    most filled-in fields is kept, missing fields on it are backfilled from
-    the others, and the others are soft-deleted (deleted_at, recoverable like
-    every other soft delete in this app — never a hard delete).
+    created before add_deal() normalized/deduped on write. Groups on
+    (entity_id, normalized territory, normalized broadcaster, period_start,
+    period_end) — the plain string-based key add_deal() used before
+    deal_entities existed. NOT the same key add_deal() uses today (which
+    prefers matching on resolved market/broadcaster entity-id sets — see
+    add_deal()'s docstring); this pass is a coarser, standalone hygiene sweep
+    over the whole table and hasn't been updated to the entity-set key.
+    Within a group the row with the most filled-in fields is kept, missing
+    fields on it are backfilled from the others, and the others are
+    soft-deleted (deleted_at, recoverable like every other soft delete in
+    this app — never a hard delete).
 
     Returns the merge plan either way: [{"keep": id, "merge": [ids...],
     "entity": canonical_name, "territory":, "broadcaster":, "period": "..",
@@ -1101,14 +1246,27 @@ def get_deals_for_entity(
     include_superseded: bool = False,
     path: Path = DB_PATH,
 ) -> list[dict]:
-    """Return deals for an entity, newest first."""
+    """
+    Return deals for an entity, newest first — as its property, or via any
+    market/broadcaster it's linked to through deal_entities. Matches on
+    entity_id directly too, not just the join table: a deal always has
+    entity_id set (it's kept in place during the deal_entities migration),
+    but deal_entities may not be populated yet for rows written before this
+    linking existed — matching on both means nothing regresses mid-deploy,
+    and coverage only grows as deal_entities fills in (see
+    backfill_deal_entities.py).
+    """
     with _conn(path) as con:
-        status_filter = "" if include_superseded else "AND status != 'superseded'"
+        status_filter = "" if include_superseded else "AND d.status != 'superseded'"
         rows = con.execute(f"""
-            SELECT * FROM deals
-            WHERE entity_id = ? AND deleted_at IS NULL {status_filter}
-            ORDER BY date_added DESC
-        """, (entity_id,)).fetchall()
+            SELECT DISTINCT d.* FROM deals d
+            WHERE d.deleted_at IS NULL {status_filter}
+              AND (
+                d.entity_id = ?
+                OR d.id IN (SELECT deal_id FROM deal_entities WHERE entity_id = ?)
+              )
+            ORDER BY d.date_added DESC
+        """, (entity_id, entity_id)).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -1117,20 +1275,29 @@ def get_deals_for_entities(
     include_superseded: bool = False,
     path: Path = DB_PATH,
 ) -> list[dict]:
-    """Return all deals for a set of entities, with entity_name joined in, sorted by entity then territory."""
+    """
+    Return all deals for a set of entities, with entity_name joined in
+    (always the deal's PROPERTY name, even when the row matched via a
+    market/broadcaster link — see get_deals_for_entity's docstring for why
+    both entity_id and deal_entities are checked), sorted by entity then
+    territory.
+    """
     if not entity_ids:
         return []
     ph = ",".join("?" * len(entity_ids))
     status_filter = "" if include_superseded else "AND d.status != 'superseded'"
     with _conn(path) as con:
         rows = con.execute(f"""
-            SELECT d.*, e.canonical_name AS entity_name
+            SELECT DISTINCT d.*, e.canonical_name AS entity_name
             FROM deals d
             JOIN entities e ON d.entity_id = e.id
-            WHERE d.entity_id IN ({ph})
-              AND d.deleted_at IS NULL AND e.deleted_at IS NULL {status_filter}
+            WHERE d.deleted_at IS NULL AND e.deleted_at IS NULL {status_filter}
+              AND (
+                d.entity_id IN ({ph})
+                OR d.id IN (SELECT deal_id FROM deal_entities WHERE entity_id IN ({ph}))
+              )
             ORDER BY e.canonical_name COLLATE NOCASE, d.territory COLLATE NOCASE
-        """, list(entity_ids)).fetchall()
+        """, list(entity_ids) + list(entity_ids)).fetchall()
     return [dict(r) for r in rows]
 
 

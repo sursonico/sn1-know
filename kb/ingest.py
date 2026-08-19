@@ -520,6 +520,39 @@ def find_possible_duplicate(source: str, existing_sources: list[str]) -> Optiona
 
 _BULLET_CURRENCY_RE = re.compile(r"^[ \t]*[•\-][^\n]*[$€£]\s?\d", re.MULTILINE)
 
+_TABLE_HEADER_KEYWORDS = (
+    "territory", "market", "country", "broadcaster", "licensee",
+    "rights holder", "rightsholder", "value", "price", "fee", "amount",
+    "currency", "period", "start date", "end date", "term",
+)
+
+
+def _count_table_deal_rows(text: str) -> int:
+    """
+    Detect spreadsheet-style deal tables that _BULLET_CURRENCY_RE can't see at
+    all: a header row naming rights-ledger columns (territory/broadcaster/
+    value/period/...) — XLSX sheets are stored as one tab-joined line per row
+    (see _extract_xlsx) — followed by data rows carrying a bare numeric value
+    with no currency symbol inline (the unit lives in the header, e.g. "Value
+    (EURm)"). Counts rows after the first line that names >=3 rights-ledger
+    columns and has at least one multi-cell data row with a digit in it.
+    """
+    lines = [l for l in text.split("\n") if l.strip()]
+    header_idx = None
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if sum(1 for kw in _TABLE_HEADER_KEYWORDS if kw in low) >= 3:
+            header_idx = i
+            break
+    if header_idx is None:
+        return 0
+    n_rows = 0
+    for line in lines[header_idx + 1:]:
+        is_multi_cell = line.count("\t") >= 1 or line.count(",") >= 2
+        if is_multi_cell and re.search(r"\d", line):
+            n_rows += 1
+    return n_rows
+
 
 def _compute_validation_warning(
     chunk_texts: list[str],
@@ -547,19 +580,23 @@ def _compute_validation_warning(
          entities).
       3. Silent per-chunk deal-extraction shortfall: `chunk_deal_counts` is
          (chunk_num, text, n_deals) for every chunk extraction was actually
-         attempted on. Counts currency-bearing bullet lines in the text as a
-         proxy for how many deals the page plausibly has, and flags any chunk
-         where the written count is well below that — not just zero. A page
-         losing 18 of 19 deals (Serie A: 19 bullets, 1 written) is exactly as
-         damaging as one losing all of them, and a zero-only check misses it
-         entirely. Checking per-chunk rather than a document-level total also
-         matters on its own: a page that fails out of a 13-page deck still
-         leaves the *document* total well above zero, so an aggregate check
-         never fires even though that one page's deals are silently missing —
-         what happened to Formula 1/NHL/WTA in PROPERTIES OVERVIEW.pdf's first
-         re-ingest. Only fires on chunks dense enough (>=4 bullets) to trust
-         the signal, and only when the shortfall is severe (written count
-         under half the bullet count) — a looser bar than the retry-time
+         attempted on. Estimates how many deals the page plausibly has two
+         ways — currency-bearing bullet lines (prose slides/pages) and
+         spreadsheet-style tables (a header row naming rights-ledger columns
+         plus data rows, for XLSX sheets where a bare numeric value in a
+         column has no inline currency symbol at all, so the bullet check
+         alone is blind to it) — and flags any chunk where the written count
+         is well below the higher of the two, not just zero. A page losing 18
+         of 19 deals (Serie A: 19 bullets, 1 written) is exactly as damaging
+         as one losing all of them, and a zero-only check misses it entirely.
+         Checking per-chunk rather than a document-level total also matters on
+         its own: a page that fails out of a 13-page deck still leaves the
+         *document* total well above zero, so an aggregate check never fires
+         even though that one page's deals are silently missing — what
+         happened to Formula 1/NHL/WTA in PROPERTIES OVERVIEW.pdf's first
+         re-ingest. Only fires on chunks dense enough (>=4 bullets/rows) to
+         trust the signal, and only when the shortfall is severe (written
+         count under half the signal) — a looser bar than the retry-time
          check in kb.llm._looks_incomplete, since this is the last line of
          defense after retries are already exhausted.
     """
@@ -587,12 +624,14 @@ def _compute_validation_warning(
         flagged = []
         for chunk_num, text, n_deals in chunk_deal_counts:
             n_bullets = len(_BULLET_CURRENCY_RE.findall(text))
-            if n_bullets >= 4 and n_deals < max(1, n_bullets // 2):
-                flagged.append(f"{chunk_num} ({n_deals}/{n_bullets})")
+            n_table_rows = _count_table_deal_rows(text)
+            n_signal = max(n_bullets, n_table_rows)
+            if n_signal >= 4 and n_deals < max(1, n_signal // 2):
+                flagged.append(f"{chunk_num} ({n_deals}/{n_signal})")
         if flagged:
             warnings.append(
-                f"Deal count implausibly low vs. currency bullets on page(s)/slide(s) "
-                f"{', '.join(flagged)} (written/bullets)"
+                f"Deal count implausibly low vs. currency bullets/table rows on "
+                f"page(s)/slide(s) {', '.join(flagged)} (written/signal)"
             )
 
     if not warnings:
