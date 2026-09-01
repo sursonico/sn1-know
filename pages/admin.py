@@ -1,4 +1,5 @@
 """Entity admin page — /admin"""
+import pandas as pd
 import streamlit as st
 from config import DELETED_RETENTION_DAYS
 from kb.ui import page_setup, section_title, entity_type_badge, ENTITY_TYPE_META
@@ -6,10 +7,11 @@ from kb.db import (
     get_all_entities, get_proposed_entities, get_entity, get_entity_stats,
     update_entity, merge_entities, upsert_entity, index_entry,
     get_entries_for_entity, get_deleted_entries, restore_entry, purge_entry,
-    get_purgeable_entry_ids, purge_expired_deleted,
+    get_purgeable_entry_ids, purge_expired_deleted, _conn, DB_PATH,
 )
 from kb.eval import run_case, load_eval_set, EVAL_SET_PATH
 from seed_entities import seed
+from backfill_deal_entities import compute_plan as compute_deal_entities_plan, apply_plan as apply_deal_entities_plan
 
 page_setup("admin", title="Admin — SN1 Knowledge Base")
 section_title("Entity management")
@@ -23,6 +25,172 @@ with st.expander("Bootstrap canonical entities", expanded=False):
         n = seed(verbose=False)
         st.success(f"Seeded {n} canonical entities.")
         st.rerun()
+
+with st.expander("Backfill deal entity links", expanded=False):
+    st.caption(
+        "Links existing deals to their market/broadcaster entities via deal_entities, "
+        "so a deal is findable from its property page AND every market/broadcaster page "
+        "it touches — not just the property. Splits territory/broadcaster on `;` `/` `,` "
+        "and resolves each part the same way add_deal() does for new writes. Runs the "
+        "logic in backfill_deal_entities.py — use this when there's no shell access to run "
+        "it as a CLI (e.g. on Render)."
+    )
+    st.caption(
+        "**Apply is additive only** — every write is `INSERT OR IGNORE INTO deal_entities`. "
+        "It never updates or deletes a deal or an existing link, and is safe to re-run."
+    )
+
+    col_preview, col_apply = st.columns(2)
+    preview_clicked = col_preview.button("Preview", key="de_preview")
+    apply_clicked = col_apply.button("Apply", key="de_apply", type="primary")
+
+    if preview_clicked:
+        st.session_state["de_plan"] = compute_deal_entities_plan(DB_PATH)
+
+    if apply_clicked:
+        plan = st.session_state.get("de_plan") or compute_deal_entities_plan(DB_PATH)
+        n_written = apply_deal_entities_plan(plan, DB_PATH)
+        st.session_state["de_plan"] = None
+        st.session_state["de_applied"] = (n_written, plan["n_deals_touched"])
+        st.rerun()
+
+    if "de_applied" in st.session_state:
+        n_written, n_deals = st.session_state.pop("de_applied")
+        st.success(f"Wrote {n_written} new link(s) across {n_deals} deal(s).")
+        with _conn(DB_PATH) as con:
+            role_counts = con.execute(
+                "SELECT role, COUNT(*) AS n FROM deal_entities GROUP BY role ORDER BY role"
+            ).fetchall()
+        st.write("deal_entities counts by role:")
+        st.dataframe(pd.DataFrame([dict(r) for r in role_counts]), use_container_width=True, hide_index=True)
+
+    plan = st.session_state.get("de_plan")
+    if plan:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Links to create", plan["n_new_links"])
+        m2.metric("Deals affected", plan["n_deals_touched"])
+        m3.metric("Deals already linked", plan["n_already_linked"])
+        n_unresolved = len(plan["fully_unresolved_deal_ids"])
+        st.caption(f"{n_unresolved} deal(s) had nothing resolvable at all (neither territory nor broadcaster matched any entity).")
+
+        if plan["to_link"]:
+            st.write(f"Sample of proposed links (showing up to 20 of {plan['n_deals_touched']} affected deals):")
+            sample_rows = [
+                {"deal_id": item["deal_id"], "territory": item["territory"], "broadcaster": item["broadcaster"],
+                 "would link": name, "role": role}
+                for item in plan["to_link"][:20]
+                for _eid, role, name in item["links"]
+            ]
+            st.dataframe(pd.DataFrame(sample_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.write("**Unresolved strings — create entities**")
+    st.caption(
+        "Every distinct territory/broadcaster string that failed to resolve, across every "
+        "deal (not just the fully-unresolved ones — a deal with one resolved side still "
+        "leaves a real gap on the other), with how many deals reference it. Selected rows "
+        "are created via the same `upsert_entity()` path as 'Create New' above, so canonical "
+        "naming and aliases work as normal — territories become `market` entities, "
+        "broadcasters become `broadcaster` entities. Creating an entity here does not write "
+        "any deal_entities links by itself — click Preview then Apply above afterward to "
+        "link the deals that are now resolvable."
+    )
+
+    de_plan = st.session_state.get("de_plan")
+    if not de_plan:
+        st.info("Click Preview above to load the unresolved strings.")
+    else:
+        edited_territory = None
+        edited_broadcaster = None
+
+        if de_plan["unresolved_territory"]:
+            n_territory_deals = sum(r["count"] for r in de_plan["unresolved_territory"])
+            st.write(
+                f"Territories — {len(de_plan['unresolved_territory'])} distinct string(s), "
+                f"{n_territory_deals} deal reference(s):"
+            )
+            st.caption(
+                "**Broad region** = a continental/global catch-all ('Global', 'Europe', 'Asia', …) "
+                "rather than a bounded rights market — pre-unchecked, since these would just create "
+                "a confusing rollup once individual countries are tracked, not a genuine distinct "
+                "territory. Established multi-country groupings this app already treats as real "
+                "markets (MENA, Nordics, Balkans, DACH, Sub-Saharan Africa) are NOT flagged here — "
+                "review and override any row's checkbox either direction before creating."
+            )
+            territory_df = pd.DataFrame([
+                {"Create?": not r["broad_region"], "text": r["text"], "count": r["count"],
+                 "broad region": r["broad_region"]}
+                for r in de_plan["unresolved_territory"]
+            ])
+            edited_territory = st.data_editor(
+                territory_df, key="de_territory_editor", hide_index=True, use_container_width=True,
+                disabled=["text", "count", "broad region"],
+                column_config={"Create?": st.column_config.CheckboxColumn("Create?")},
+            )
+
+        if de_plan["unresolved_broadcaster"]:
+            n_broadcaster_deals = sum(r["count"] for r in de_plan["unresolved_broadcaster"])
+            st.write(
+                f"Broadcasters — {len(de_plan['unresolved_broadcaster'])} distinct string(s), "
+                f"{n_broadcaster_deals} deal reference(s):"
+            )
+            broadcaster_df = pd.DataFrame([
+                {"Create?": True, "text": r["text"], "count": r["count"]}
+                for r in de_plan["unresolved_broadcaster"]
+            ])
+            edited_broadcaster = st.data_editor(
+                broadcaster_df, key="de_broadcaster_editor", hide_index=True, use_container_width=True,
+                disabled=["text", "count"],
+                column_config={"Create?": st.column_config.CheckboxColumn("Create?")},
+            )
+
+        if (edited_territory is not None or edited_broadcaster is not None) and st.button(
+            "Create selected as entities", key="de_create_entities", type="primary"
+        ):
+            if "de_baseline" not in st.session_state:
+                st.session_state["de_baseline"] = {
+                    "fully_unresolved": len(de_plan["fully_unresolved_deal_ids"]),
+                    "unresolved_strings": len(de_plan["unresolved_territory"]) + len(de_plan["unresolved_broadcaster"]),
+                }
+
+            n_created = 0
+            if edited_territory is not None:
+                for _, row in edited_territory.iterrows():
+                    if row["Create?"]:
+                        upsert_entity(row["text"], "market", "", is_proposed=0)
+                        n_created += 1
+            if edited_broadcaster is not None:
+                for _, row in edited_broadcaster.iterrows():
+                    if row["Create?"]:
+                        upsert_entity(row["text"], "broadcaster", "", is_proposed=0)
+                        n_created += 1
+
+            st.session_state["de_plan"] = compute_deal_entities_plan(DB_PATH)
+            st.success(
+                f"Created {n_created} entit{'y' if n_created == 1 else 'ies'}. "
+                f"Click Apply above to write the newly-resolvable links."
+            )
+            st.rerun()
+
+    de_baseline = st.session_state.get("de_baseline")
+    if de_baseline:
+        current_plan = st.session_state.get("de_plan") or compute_deal_entities_plan(DB_PATH)
+        current_fully_unresolved = len(current_plan["fully_unresolved_deal_ids"])
+        current_unresolved_strings = len(current_plan["unresolved_territory"]) + len(current_plan["unresolved_broadcaster"])
+        st.write("**Progress this session**")
+        p1, p2 = st.columns(2)
+        p1.metric(
+            "Deals with nothing resolved", current_fully_unresolved,
+            delta=current_fully_unresolved - de_baseline["fully_unresolved"], delta_color="inverse",
+        )
+        p2.metric(
+            "Distinct unresolved strings", current_unresolved_strings,
+            delta=current_unresolved_strings - de_baseline["unresolved_strings"], delta_color="inverse",
+        )
+        st.caption(
+            f"Baseline when this session started: {de_baseline['fully_unresolved']} deal(s), "
+            f"{de_baseline['unresolved_strings']} string(s)."
+        )
 
 _deleted_entries = get_deleted_entries()
 _deleted_label = (

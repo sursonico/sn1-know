@@ -902,14 +902,42 @@ _DEAL_FILLABLE_FIELDS = [
     "source_entry_id", "source_note", "flagged_for_review",
 ]
 
-_MULTI_VALUE_RE = re.compile(r"[;/,]")
+_MULTI_VALUE_DELIMS = frozenset(";/,")
+_MULTI_VALUE_OPEN = {"(": ")", "[": "]"}
+_MULTI_VALUE_CLOSE = {")", "]"}
 
 
 def split_multi_value(s: str) -> list[str]:
-    """Split a compound territory/broadcaster string ('Turkey, Ukraine',
+    """
+    Split a compound territory/broadcaster string ('Turkey, Ukraine',
     'Nine/Stan Sport') into its parts, so each can be resolved and linked to
-    its own entity instead of the whole row only ever matching one."""
-    return [p.strip() for p in _MULTI_VALUE_RE.split(s or "") if p.strip()]
+    its own entity instead of the whole row only ever matching one.
+
+    Only splits on ; / , at bracket depth zero — 'Disney (ABC/ESPN)' and
+    'Latin America (ex Brazil, Mexico)' stay whole instead of shattering into
+    'Disney (ABC' + 'ESPN)' or 'Latin America (ex Brazil' + 'Mexico)'. Nesting
+    is depth-counted, not type-matched (a stray/mismatched bracket can't push
+    depth negative — it's clamped at zero), so malformed brackets in source
+    text degrade to "don't split here" rather than raising.
+    """
+    s = s or ""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in s:
+        if ch in _MULTI_VALUE_OPEN:
+            depth += 1
+            buf.append(ch)
+        elif ch in _MULTI_VALUE_CLOSE:
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch in _MULTI_VALUE_DELIMS and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
 
 
 def resolve_entity_ids(parts: list[str], entity_type: str, path: Path = DB_PATH) -> list[int]:
