@@ -6,7 +6,7 @@ import streamlit as st
 
 from kb.ui import (
     page_setup, entity_card_html, section_title, stats_strip, ENTITY_TYPE_META,
-    remove_from_home_control, home_removal_pending,
+    home_removal_pending, home_card_remove_trigger, home_card_remove_followup,
 )
 from kb.db import get_entity_stats, get_stats, get_all_entries
 
@@ -69,15 +69,19 @@ if featured:
         for col_i, entity in enumerate(featured[row_start:row_start + COLS]):
             with cols[col_i]:
                 st.markdown(entity_card_html(entity, show_badge=True), unsafe_allow_html=True)
-                if st.button(
-                    "Open →",
-                    key=f"card_{entity['id']}",
-                    use_container_width=True,
-                    type="secondary",
-                ):
-                    st.session_state["entity_id"] = entity["id"]
-                    st.switch_page(st.session_state["_pages"]["entity"])
-                remove_from_home_control(entity, key_suffix="home_card")
+                open_col, remove_col = st.columns([4, 1])
+                with open_col:
+                    if st.button(
+                        "Open →",
+                        key=f"card_{entity['id']}",
+                        use_container_width=True,
+                        type="secondary",
+                    ):
+                        st.session_state["entity_id"] = entity["id"]
+                        st.switch_page(st.session_state["_pages"]["entity"])
+                with remove_col:
+                    home_card_remove_trigger(entity, key_suffix="home_card")
+                home_card_remove_followup(entity, key_suffix="home_card")
 else:
     st.info(
         "No entities are featured on this page yet. "

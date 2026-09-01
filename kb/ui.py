@@ -176,6 +176,16 @@ button[data-testid="stBaseButton-secondary"] {
 }
 button[data-testid="stBaseButton-secondary"]:hover:not(:disabled) { background:#F3ECE0 !important; }
 
+/* ── Home card: compact red "remove from Home" trigger only — scoped by the
+   widget key so the entity-hub page's full-width control keeps the normal
+   gold secondary style. */
+div[class*="st-key-home_remove_"][class*="_home_card"] button[data-testid="stBaseButton-secondary"] {
+    border-color:#B23B3B !important; color:#B23B3B !important; padding:0.5rem 0.6rem !important;
+}
+div[class*="st-key-home_remove_"][class*="_home_card"] button[data-testid="stBaseButton-secondary"]:hover:not(:disabled) {
+    background:#FBEAEA !important; border-color:#8F2D2D !important; color:#8F2D2D !important;
+}
+
 /* ── Inputs */
 .stTextInput input, .stTextArea textarea, [data-baseweb="select"] > div:first-child {
     font-family:'Lato',sans-serif !important; font-size:0.93rem !important;
@@ -433,42 +443,65 @@ def home_removal_pending(entity_id: int, key_suffix: str = "") -> bool:
     )
 
 
-def remove_from_home_control(entity: dict, key_suffix: str = "") -> None:
-    """Two-step inline control to unfeature an entity from the Home page.
-
-    Flips the same `is_featured` flag Admin's 'Show on Home page' checkbox
-    writes via `update_entity()` — no separate removal path, so this is
-    exactly as reversible as toggling that checkbox back on. State
-    (confirm-pending / just-removed) is session-scoped per entity+key_suffix,
-    so Home's card grid and the entity hub page don't collide.
+def _render_pending_home_removal(entity_id: int, name: str, key_suffix: str) -> bool:
+    """Render the confirm-pending or just-removed step for one entity, if
+    either is active. Returns True if it rendered something (caller should
+    skip the trigger button), False if nothing is pending.
     """
-    eid = entity["id"]
-    name = entity.get("canonical_name", "")
-    removed_key = f"home_removed_{eid}_{key_suffix}"
-    confirm_key = f"home_confirm_{eid}_{key_suffix}"
+    removed_key = f"home_removed_{entity_id}_{key_suffix}"
+    confirm_key = f"home_confirm_{entity_id}_{key_suffix}"
 
     if st.session_state.get(removed_key):
         st.caption("Removed from Home.")
-        if st.button("Undo", key=f"home_undo_{eid}_{key_suffix}", use_container_width=True):
-            db.update_entity(eid, is_featured=1)
+        if st.button("Undo", key=f"home_undo_{entity_id}_{key_suffix}", use_container_width=True):
+            db.update_entity(entity_id, is_featured=1)
             st.session_state.pop(removed_key, None)
             st.rerun()
-        return
+        return True
 
     if st.session_state.get(confirm_key):
         st.caption(f"Remove '{name}' from Home?")
         c_cancel, c_confirm = st.columns(2)
-        if c_cancel.button("Cancel", key=f"home_cancel_{eid}_{key_suffix}", use_container_width=True):
+        if c_cancel.button("Cancel", key=f"home_cancel_{entity_id}_{key_suffix}", use_container_width=True):
             st.session_state.pop(confirm_key, None)
             st.rerun()
         if c_confirm.button(
-            "Confirm", key=f"home_confirm_btn_{eid}_{key_suffix}",
+            "Confirm", key=f"home_confirm_btn_{entity_id}_{key_suffix}",
             type="primary", use_container_width=True,
         ):
-            db.update_entity(eid, is_featured=0)
+            db.update_entity(entity_id, is_featured=0)
             st.session_state.pop(confirm_key, None)
             st.session_state[removed_key] = True
             st.rerun()
+        return True
+
+    return False
+
+
+def home_removal_pending(entity_id: int, key_suffix: str = "") -> bool:
+    """True while a removal is mid-flow (confirming, or just removed with its
+    Undo still showing) for this entity+key_suffix. Callers that filter a
+    list down to featured entities should keep one whose removal is still
+    pending, so its Undo control doesn't vanish mid-flow.
+    """
+    return bool(
+        st.session_state.get(f"home_confirm_{entity_id}_{key_suffix}")
+        or st.session_state.get(f"home_removed_{entity_id}_{key_suffix}")
+    )
+
+
+def remove_from_home_control(entity: dict, key_suffix: str = "") -> None:
+    """Two-step inline control to unfeature an entity from the Home page —
+    trigger, confirm and undo all in one place. Used on the entity hub page,
+    which has room for the full-width control.
+
+    Flips the same `is_featured` flag Admin's 'Show on Home page' checkbox
+    writes via `update_entity()` — no separate removal path, so this is
+    exactly as reversible as toggling that checkbox back on.
+    """
+    eid = entity["id"]
+    name = entity.get("canonical_name", "")
+    if _render_pending_home_removal(eid, name, key_suffix):
         return
 
     if st.button(
@@ -477,8 +510,37 @@ def remove_from_home_control(entity: dict, key_suffix: str = "") -> None:
         help="Unfeatures this entity from the Home page — same as unticking "
              "'Show on Home page' in Admin. It stays reachable via Browse and Ask.",
     ):
-        st.session_state[confirm_key] = True
+        st.session_state[f"home_confirm_{eid}_{key_suffix}"] = True
         st.rerun()
+
+
+def home_card_remove_trigger(entity: dict, key_suffix: str = "") -> None:
+    """Compact icon-only trigger for the Home card grid — place inside a
+    narrow column alongside 'Open →' (e.g. st.columns([4, 1])). Renders
+    nothing once a removal is pending for this entity; call
+    `home_card_remove_followup()` right after the columns block ends so the
+    confirm/undo step gets the full row width instead of the narrow column.
+    """
+    eid = entity["id"]
+    if home_removal_pending(eid, key_suffix):
+        return
+    name = entity.get("canonical_name", "")
+    if st.button(
+        "🗑", key=f"home_remove_{eid}_{key_suffix}", use_container_width=True,
+        help=f"Remove '{name}' from Home — same as unticking 'Show on Home "
+             f"page' in Admin. It stays reachable via Browse and Ask.",
+    ):
+        st.session_state[f"home_confirm_{eid}_{key_suffix}"] = True
+        st.rerun()
+
+
+def home_card_remove_followup(entity: dict, key_suffix: str = "") -> None:
+    """Full-width confirm/undo step following `home_card_remove_trigger()`.
+    No-op unless a removal is pending for this entity+key_suffix.
+    """
+    eid = entity["id"]
+    name = entity.get("canonical_name", "")
+    _render_pending_home_removal(eid, name, key_suffix)
 
 
 def section_title(text: str) -> None:
