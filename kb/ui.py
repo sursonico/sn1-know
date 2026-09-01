@@ -421,6 +421,66 @@ def entity_card_html(entity: dict, show_badge: bool = True) -> str:
     )
 
 
+def home_removal_pending(entity_id: int, key_suffix: str = "") -> bool:
+    """True while `remove_from_home_control()` is mid-flow (confirming, or just
+    removed with its Undo still showing) for this entity+key_suffix. Callers
+    that filter a list down to featured entities should keep one whose removal
+    is still pending, so its Undo control doesn't vanish mid-flow.
+    """
+    return bool(
+        st.session_state.get(f"home_confirm_{entity_id}_{key_suffix}")
+        or st.session_state.get(f"home_removed_{entity_id}_{key_suffix}")
+    )
+
+
+def remove_from_home_control(entity: dict, key_suffix: str = "") -> None:
+    """Two-step inline control to unfeature an entity from the Home page.
+
+    Flips the same `is_featured` flag Admin's 'Show on Home page' checkbox
+    writes via `update_entity()` — no separate removal path, so this is
+    exactly as reversible as toggling that checkbox back on. State
+    (confirm-pending / just-removed) is session-scoped per entity+key_suffix,
+    so Home's card grid and the entity hub page don't collide.
+    """
+    eid = entity["id"]
+    name = entity.get("canonical_name", "")
+    removed_key = f"home_removed_{eid}_{key_suffix}"
+    confirm_key = f"home_confirm_{eid}_{key_suffix}"
+
+    if st.session_state.get(removed_key):
+        st.caption("Removed from Home.")
+        if st.button("Undo", key=f"home_undo_{eid}_{key_suffix}", use_container_width=True):
+            db.update_entity(eid, is_featured=1)
+            st.session_state.pop(removed_key, None)
+            st.rerun()
+        return
+
+    if st.session_state.get(confirm_key):
+        st.caption(f"Remove '{name}' from Home?")
+        c_cancel, c_confirm = st.columns(2)
+        if c_cancel.button("Cancel", key=f"home_cancel_{eid}_{key_suffix}", use_container_width=True):
+            st.session_state.pop(confirm_key, None)
+            st.rerun()
+        if c_confirm.button(
+            "Confirm", key=f"home_confirm_btn_{eid}_{key_suffix}",
+            type="primary", use_container_width=True,
+        ):
+            db.update_entity(eid, is_featured=0)
+            st.session_state.pop(confirm_key, None)
+            st.session_state[removed_key] = True
+            st.rerun()
+        return
+
+    if st.button(
+        "✕ Remove from Home", key=f"home_remove_{eid}_{key_suffix}",
+        use_container_width=True,
+        help="Unfeatures this entity from the Home page — same as unticking "
+             "'Show on Home page' in Admin. It stays reachable via Browse and Ask.",
+    ):
+        st.session_state[confirm_key] = True
+        st.rerun()
+
+
 def section_title(text: str) -> None:
     st.markdown(f'<div class="section-title">{text}</div>', unsafe_allow_html=True)
 

@@ -7,7 +7,8 @@ import streamlit as st
 
 from kb.ui import (
     page_setup, entity_type_badge, section_title,
-    reliability_badge_html, open_file_button,
+    reliability_badge_html, open_file_button, remove_from_home_control,
+    home_removal_pending,
 )
 from kb import db
 from kb.llm import generate_entity_overview
@@ -555,4 +556,14 @@ else:
             + ", ".join(f"{s['source']} ({s.get('entry_date', '?')})" for s in snips[:8])
             + ("…" if len(snips) > 8 else "")
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — Page actions
+# ═══════════════════════════════════════════════════════════════════════════════
+if entity.get("is_featured") or home_removal_pending(entity_id, key_suffix="entity_page"):
+    st.markdown('<div style="height:0.5rem"></div>', unsafe_allow_html=True)
+    _pa_col, _ = st.columns([1, 3])
+    with _pa_col:
+        remove_from_home_control(entity, key_suffix="entity_page")
 

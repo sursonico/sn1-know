@@ -4,7 +4,10 @@ SN1 Knowledge Base — Home page (served via st.navigation in app.py)
 
 import streamlit as st
 
-from kb.ui import page_setup, entity_card_html, section_title, stats_strip, ENTITY_TYPE_META
+from kb.ui import (
+    page_setup, entity_card_html, section_title, stats_strip, ENTITY_TYPE_META,
+    remove_from_home_control, home_removal_pending,
+)
 from kb.db import get_entity_stats, get_stats, get_all_entries
 
 page_setup("home")
@@ -50,7 +53,10 @@ stats_strip(stats)
 
 # ── Featured entity cards ─────────────────────────────────────────────────────
 entity_stats = get_entity_stats()
-featured = [e for e in entity_stats if e.get("is_featured")]
+featured = [
+    e for e in entity_stats
+    if e.get("is_featured") or home_removal_pending(e["id"], key_suffix="home_card")
+]
 COLS = 3
 
 if featured:
@@ -71,6 +77,7 @@ if featured:
                 ):
                     st.session_state["entity_id"] = entity["id"]
                     st.switch_page(st.session_state["_pages"]["entity"])
+                remove_from_home_control(entity, key_suffix="home_card")
 else:
     st.info(
         "No entities are featured on this page yet. "
