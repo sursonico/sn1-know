@@ -34,14 +34,19 @@ def _fmt_date_part(s: str) -> str:
     return s  # year-only, season format, or anything else: display as-is
 
 
+_CURRENCY_SYMBOLS = {"GBP": "£", "EUR": "€", "USD": "$", "AUD": "A$", "CAD": "C$"}
+
+
+def _fmt_money(v: float, currency: str) -> str:
+    sym = _CURRENCY_SYMBOLS.get((currency or "").upper(), f"{currency} " if currency else "")
+    return f"{sym}{v/1000:.2g}bn" if v >= 1000 else f"{sym}{v:.4g}m"
+
+
 def _fmt_value(deal: dict) -> str:
     """Return value + currency only — no qualifier text (that goes in the Notes column)."""
-    v        = deal.get("value")
-    currency = (deal.get("currency") or "").upper()
-    SYMBOLS  = {"GBP": "£", "EUR": "€", "USD": "$", "AUD": "A$", "CAD": "C$"}
-    sym      = SYMBOLS.get(currency, f"{currency} " if currency else "")
+    v = deal.get("value")
     if v is not None:
-        return f"{sym}{v/1000:.2g}bn" if v >= 1000 else f"{sym}{v:.4g}m"
+        return _fmt_money(v, deal.get("currency") or "")
     return "—"
 
 
@@ -116,6 +121,92 @@ def _deal_table_html(deals: list[dict], conflict_territories: set[str], show_pro
         '</tr></thead>'
         f'<tbody>{rows_html}</tbody>'
         '</table></div>'
+    )
+
+
+def _market_share_html(shares: dict) -> str:
+    """
+    Market-page broadcaster aggregate: one table per currency (spend/share
+    can't be summed across currencies with no FX source — see
+    get_broadcaster_market_shares()'s docstring), each showing every
+    broadcaster active in that currency, sorted by spend descending, plus
+    caveats for what the tables above necessarily leave out.
+    """
+    if not shares["currencies"]:
+        return ""
+
+    tables_html = ""
+    for cur in shares["currencies"]:
+        rows_html = ""
+        for r in cur["rows"]:
+            deals_label = f'{r["n_deals"]} deal{"s" if r["n_deals"] != 1 else ""}'
+            if r["n_no_value"]:
+                deals_label += f', {r["n_no_value"]} without a value'
+            props_str = ", ".join(r["properties"]) or "—"
+            rows_html += (
+                '<tr>'
+                f'<td style="font-weight:600;color:#2B383E">{r["broadcaster_name"]}</td>'
+                f'<td style="font-variant-numeric:tabular-nums;white-space:nowrap">'
+                f'{_fmt_money(r["spend"], cur["currency"])}</td>'
+                f'<td style="font-variant-numeric:tabular-nums;white-space:nowrap">'
+                f'{r["share"]*100:.0f}%</td>'
+                f'<td style="color:#5A5A5A;font-size:0.88rem;white-space:nowrap">{deals_label}</td>'
+                f'<td style="font-size:0.83rem">{props_str}</td>'
+                '</tr>\n'
+            )
+        tables_html += (
+            f'<p style="font-size:0.78rem;color:#8A9598;text-transform:uppercase;'
+            f'letter-spacing:0.05em;margin:1rem 0 0.4rem">'
+            f'{cur["currency"]} — {_fmt_money(cur["total"], cur["currency"])} total</p>'
+            '<div style="overflow-x:auto;border:1px solid #E0D8CC;border-radius:8px">'
+            '<table class="deals-table">'
+            '<thead><tr>'
+            '<th>Broadcaster</th><th>Spend</th><th>Share</th><th>Deals</th><th>Properties held</th>'
+            '</tr></thead>'
+            f'<tbody>{rows_html}</tbody>'
+            '</table></div>'
+        )
+
+    caveats: list[str] = [
+        "Grouped by currency rather than converted to one total — this app has no FX "
+        "rate source, so summing across currencies would misstate spend rather than "
+        "just look untidy."
+    ]
+    if shares["n_unattributed_deals"]:
+        val_str = ", ".join(
+            _fmt_money(v, c) for c, v in sorted(shares["unattributed_value_by_currency"].items())
+        )
+        names_str = ", ".join(shares["unattributed_names"][:8])
+        if len(shares["unattributed_names"]) > 8:
+            names_str += ", …"
+        caveats.append(
+            f'{shares["n_unattributed_deals"]} deal(s) worth {val_str} have a value but a '
+            f'broadcaster name that never resolved to a seeded entity, so they can\'t be '
+            f'attributed to a row above ({names_str}) — this can be a large share of a '
+            f'market\'s real value; treat the tables as a lower bound.'
+        )
+    if shares["n_no_value_deals"]:
+        caveats.append(
+            f'{shares["n_no_value_deals"]} deal(s) in this market have no usable value '
+            f'(undisclosed, or a figure with no currency) and are excluded from spend and '
+            f'share — still counted in each row\'s deal total where attributed.'
+        )
+    caveats.append(
+        "No field distinguishes a sub-licence or a pan-regional/combined-territory value "
+        "from a standalone market figure — a few rows in the table above are one of "
+        "those (visible only as free text in Notes, e.g. \"sublicense\" or \"combined "
+        "… deal\"), and their full value is counted here as if it belonged to this "
+        "market alone. That's a schema gap, not a display choice — nothing here is "
+        "excluded for it."
+    )
+
+    caveats_html = "".join(
+        f'<li style="margin-bottom:0.3rem">{c}</li>' for c in caveats
+    )
+    return (
+        f'{tables_html}'
+        f'<ul style="font-size:0.74rem;color:#AAA9A0;margin:0.75rem 0 0;padding-left:1.1rem;'
+        f'font-family:Lato,sans-serif">{caveats_html}</ul>'
     )
 
 
@@ -414,7 +505,17 @@ with st.expander("➕ Add a deal manually"):
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 3 — Broadcaster coverage
 # ═══════════════════════════════════════════════════════════════════════════════
-if deals_base:
+if entity.get("entity_type") == "market":
+    if deals_all:
+        section_title("Broadcaster coverage")
+        _shares = db.get_broadcaster_market_shares([d["id"] for d in deals_all])
+        _shares_html = _market_share_html(_shares)
+        if _shares_html:
+            st.markdown(_shares_html, unsafe_allow_html=True)
+        else:
+            st.caption("No deal in this market has both a value and a currency to aggregate.")
+
+elif deals_base:
     section_title("Broadcaster coverage")
 
     _CUR_YEAR   = date.today().year

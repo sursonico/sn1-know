@@ -1338,6 +1338,132 @@ def get_deals_for_entity(
         return [dict(r) for r in rows]
 
 
+def get_broadcaster_market_shares(deal_ids: list[int], path: Path = DB_PATH) -> dict:
+    """
+    Aggregate spend, share, deal counts and properties held per broadcaster
+    entity, grouped by currency, for exactly the given deal ids. Callers pass
+    the same ids already shown in a market's deals table (e.g. deals_all) so
+    the result reconciles exactly with what's rendered above it — same
+    superseded toggle, same excluded rows.
+
+    Grouped by currency rather than converted to one — this app has no FX
+    rate source, so summing across currencies would silently misstate spend.
+    A broadcaster active in more than one currency in this market gets one
+    row per currency; deal/no-value counts are scoped to that currency too
+    (not the broadcaster's total across all currencies), so each currency's
+    numbers are self-contained.
+
+    Two things a naive attributed-only view would hide, both surfaced here
+    instead of silently dropped:
+      - n_unattributed_deals / unattributed_value_by_currency / unattributed_names
+        — deals with a real value+currency whose broadcaster text never
+        resolved to a seeded entity (deal_entities has no role='broadcaster'
+        link), so they can't be attributed to any row. Can be a large slice
+        of a market's real value — check before trusting a computed share.
+      - n_no_value_deals — deals with nothing to sum at all (value IS NULL;
+        add_deal() already guarantees a value never lands with the currency
+        blank, so this covers both cases). Still counted per broadcaster row
+        where attributed, but excluded from spend/share.
+
+    Returns:
+      currencies: [{currency, total, rows: [{broadcaster_id, broadcaster_name,
+                   spend, share, n_deals, n_no_value, properties: [...]}]}],
+                   sorted by each currency's total spend desc, rows sorted by
+                   spend desc within each currency. A (broadcaster, currency)
+                   pair with zero summed spend (e.g. every deal in that pair
+                   lacks a value) is omitted — it can't affect any share —
+                   but its deals still count toward n_no_value_deals.
+      n_unattributed_deals, unattributed_value_by_currency, unattributed_names
+      n_no_value_deals
+    """
+    empty = {
+        "currencies": [], "n_unattributed_deals": 0,
+        "unattributed_value_by_currency": {}, "unattributed_names": [],
+        "n_no_value_deals": 0,
+    }
+    if not deal_ids:
+        return empty
+
+    with _conn(path) as con:
+        ph = ",".join("?" * len(deal_ids))
+        deals = con.execute(f"""
+            SELECT d.id, d.value, d.currency, d.broadcaster,
+                   pe.canonical_name AS property_name
+            FROM deals d
+            LEFT JOIN entities pe ON pe.id = d.entity_id
+            WHERE d.id IN ({ph})
+        """, deal_ids).fetchall()
+
+        links_by_deal: dict[int, list[dict]] = {}
+        for r in con.execute(f"""
+            SELECT de.deal_id, e.id AS entity_id, e.canonical_name
+            FROM deal_entities de
+            JOIN entities e ON e.id = de.entity_id
+            WHERE de.role='broadcaster' AND de.deal_id IN ({ph})
+        """, deal_ids).fetchall():
+            links_by_deal.setdefault(r["deal_id"], []).append(
+                {"id": r["entity_id"], "name": r["canonical_name"]}
+            )
+
+    acc: dict[tuple, dict] = {}
+    n_unattributed = 0
+    unattr_value: dict[str, float] = {}
+    unattr_names: set = set()
+    n_no_value = 0
+
+    for d in deals:
+        value = d["value"]
+        currency = (d["currency"] or "").strip()
+        has_value = value is not None and bool(currency)
+        if not has_value:
+            n_no_value += 1
+
+        links = links_by_deal.get(d["id"], [])
+        if not links:
+            if has_value:
+                n_unattributed += 1
+                unattr_value[currency] = unattr_value.get(currency, 0) + value
+                unattr_names.add((d["broadcaster"] or "").strip() or "(blank)")
+            continue
+
+        for bc in links:
+            key = (bc["id"], currency)
+            row = acc.setdefault(key, {
+                "broadcaster_id": bc["id"], "broadcaster_name": bc["name"],
+                "spend": 0.0, "n_deals": 0, "n_no_value": 0, "properties": set(),
+            })
+            row["n_deals"] += 1
+            if has_value:
+                row["spend"] += value
+            else:
+                row["n_no_value"] += 1
+            row["properties"].add(d["property_name"] or "—")
+
+    by_currency: dict[str, list[dict]] = {}
+    for (_bc_id, currency), row in acc.items():
+        if not currency or row["spend"] <= 0:
+            continue
+        by_currency.setdefault(currency, []).append(row)
+
+    currencies = []
+    for currency, rows in by_currency.items():
+        total = sum(r["spend"] for r in rows)
+        rows.sort(key=lambda r: -r["spend"])
+        for r in rows:
+            r["share"] = (r["spend"] / total) if total else 0.0
+            r["properties"] = sorted(r["properties"])
+        currencies.append({"currency": currency, "total": total, "rows": rows})
+    currencies.sort(key=lambda c: -c["total"])
+
+    return {
+        "currencies": currencies,
+        "n_unattributed_deals": n_unattributed,
+        "unattributed_value_by_currency": unattr_value,
+        "unattributed_names": sorted(unattr_names),
+        "n_no_value_deals": n_no_value,
+    }
+
+
 def get_deals_for_entities(
     entity_ids: list[int],
     include_superseded: bool = False,
