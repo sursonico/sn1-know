@@ -7,7 +7,7 @@ from kb.db import (
     get_all_entities, get_proposed_entities, get_entity, get_entity_stats,
     update_entity, merge_entities, upsert_entity, index_entry,
     get_entries_for_entity, get_deleted_entries, restore_entry, purge_entry,
-    get_purgeable_entry_ids, purge_expired_deleted, _conn, DB_PATH,
+    get_purgeable_entry_ids, purge_expired_deleted, get_entity_type_counts, _conn, DB_PATH,
 )
 from kb.eval import run_case, load_eval_set, EVAL_SET_PATH
 from seed_entities import seed
@@ -26,6 +26,61 @@ with st.expander("Bootstrap canonical entities", expanded=False):
         n = seed(verbose=False)
         st.success(f"Seeded {n} canonical entities.")
         st.rerun()
+
+with st.expander("Entity types — data integrity check", expanded=False):
+    st.caption(
+        "Every distinct entity_type value currently in the database, with how many "
+        "entities use it. There's no CHECK constraint on this column, so any string "
+        "is valid at the DB level — a value not in the recognized list below wasn't "
+        "written through a path that validates against it (e.g. a bulk-create script "
+        "with a typo). Unrecognized types already render fine as a generic 'other' "
+        "badge elsewhere in the app, but broke the Active Entities editor's Type "
+        "dropdown below until that was made defensive — reassign any flagged here to "
+        "a real type."
+    )
+
+    _type_counts = get_entity_type_counts()
+    _bad_types = [r for r in _type_counts if r["entity_type"] not in ENTITY_TYPE_META]
+
+    st.dataframe(
+        pd.DataFrame([
+            {"entity_type": r["entity_type"], "count": r["n"],
+             "recognized": r["entity_type"] in ENTITY_TYPE_META}
+            for r in _type_counts
+        ]),
+        use_container_width=True, hide_index=True,
+    )
+
+    if not _bad_types:
+        st.success("Every entity_type in the database is recognized.")
+    else:
+        st.warning(
+            f"{len(_bad_types)} unrecognized type value(s) found, "
+            f"covering {sum(r['n'] for r in _bad_types)} entit{'y' if sum(r['n'] for r in _bad_types) == 1 else 'ies'} "
+            "— reassign each below."
+        )
+        _all_live = get_all_entities(include_proposed=True)
+        for _r in _bad_types:
+            _bad_type = _r["entity_type"]
+            _n = _r["n"]
+            _bad_entities = [e for e in _all_live if e["entity_type"] == _bad_type]
+            with st.container(border=True):
+                _names_str = ", ".join(e["canonical_name"] for e in _bad_entities[:20])
+                if len(_bad_entities) > 20:
+                    _names_str += f", … ({len(_bad_entities) - 20} more)"
+                st.write(f"**'{_bad_type}'** — {_n} entit{'y' if _n == 1 else 'ies'}: {_names_str}")
+                _reassign_col, _btn_col = st.columns([2, 1])
+                _reassign_to = _reassign_col.selectbox(
+                    "Reassign all to", list(ENTITY_TYPE_META.keys()),
+                    key=f"reassign_type_{_bad_type}",
+                )
+                if _btn_col.button(
+                    f"Reassign {_n}", key=f"reassign_btn_{_bad_type}", type="primary",
+                ):
+                    for e in _bad_entities:
+                        update_entity(e["id"], entity_type=_reassign_to)
+                    st.success(f"Reassigned {_n} entit{'y' if _n == 1 else 'ies'} from '{_bad_type}' to '{_reassign_to}'.")
+                    st.rerun()
 
 with st.expander("Backfill deal entity links", expanded=False):
     st.caption(
@@ -292,10 +347,16 @@ with tab_active:
 
                 col_n, col_t = st.columns(2)
                 new_name = col_n.text_input("Canonical name", value=name, key=f"name_{eid}")
+                _type_keys = list(ENTITY_TYPE_META.keys())
+                if etype in _type_keys:
+                    _type_index = _type_keys.index(etype)
+                else:
+                    _type_index = _type_keys.index("other")
+                    col_t.caption(f"⚠ Unrecognized type in database: '{etype}' — defaulting to 'other' below.")
                 new_type = col_t.selectbox(
                     "Type",
-                    list(ENTITY_TYPE_META.keys()),
-                    index=list(ENTITY_TYPE_META.keys()).index(etype),
+                    _type_keys,
+                    index=_type_index,
                     key=f"type_{eid}",
                 )
                 new_aliases = st.text_input(

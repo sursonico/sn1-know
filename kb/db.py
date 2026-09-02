@@ -698,6 +698,30 @@ def find_or_create_entity(
     return upsert_entity(canonical_name, entity_type, "", int(proposed), path)
 
 
+def get_entity_type_counts(path: Path = DB_PATH) -> list[dict]:
+    """
+    Distinct entity_type values in use across all live (non-deleted)
+    entities, with counts — a data-integrity check for Admin. There's no
+    CHECK constraint on entities.entity_type (see schema above), so any
+    string is valid at the DB level; a value here that isn't a key in
+    kb.ui.ENTITY_TYPE_META wasn't written through a path that validates
+    against the known type list (e.g. a bulk-create script with a typo) and
+    will render fine anywhere that already defaults unknown types to
+    'other' (entity_type_badge, entity_card_html) but needs reassigning
+    before it's safe to feed into code that assumes membership, like a
+    fixed-list selectbox index lookup.
+    """
+    with _conn(path) as con:
+        rows = con.execute("""
+            SELECT entity_type, COUNT(*) as n
+            FROM entities
+            WHERE deleted_at IS NULL
+            GROUP BY entity_type
+            ORDER BY n DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
 def get_all_entities(
     include_proposed: bool = False,
     path: Path = DB_PATH,

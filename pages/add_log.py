@@ -782,7 +782,7 @@ with tab_log:
         override_rel = rel_c2.selectbox(
             "Override reliability",
             rel_options,
-            index=rel_options.index(inferred_rel),
+            index=rel_options.index(inferred_rel) if inferred_rel in rel_options else rel_options.index("reported"),
             key="pending_rel_override",
             label_visibility="collapsed",
         )
