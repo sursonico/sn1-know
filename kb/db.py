@@ -1325,20 +1325,53 @@ def run_deal_dedupe(dry_run: bool = True, path: Path = DB_PATH) -> list[dict]:
     return plans
 
 
+# Fields counted toward a deal row's "completeness" for sort ordering — kept
+# as one list so kb/db.py's SQL and pages/entity.py's on-screen "N incomplete"
+# count can't drift apart on what counts as populated. `value` is numeric
+# (IS NOT NULL, not a string check); the rest are free-text columns.
+DEAL_COMPLETENESS_FIELDS = [
+    "value", "currency", "rights_holder", "period_start", "period_end",
+    "broadcaster", "territory",
+]
+_DEAL_COMPLETENESS_TEXT_FIELDS = [f for f in DEAL_COMPLETENESS_FIELDS if f != "value"]
+
+# Row completeness score (0-7): how many of DEAL_COMPLETENESS_FIELDS are
+# populated. Used to sort fuller rows above gappy ones — see
+# get_deals_for_entity()/get_deals_for_entities() docstrings for why this
+# lives in SQL rather than a post-fetch Python sort.
+_DEAL_COMPLETENESS_SQL = (
+    "(CASE WHEN d.value IS NOT NULL THEN 1 ELSE 0 END"
+    + "".join(
+        f" + CASE WHEN TRIM(COALESCE(d.{f}, '')) != '' THEN 1 ELSE 0 END"
+        for f in _DEAL_COMPLETENESS_TEXT_FIELDS
+    )
+    + ")"
+)
+
+
 def get_deals_for_entity(
     entity_id: int,
     include_superseded: bool = False,
     path: Path = DB_PATH,
 ) -> list[dict]:
     """
-    Return deals for an entity, newest first — as its property, or via any
-    market/broadcaster it's linked to through deal_entities. Matches on
-    entity_id directly too, not just the join table: a deal always has
-    entity_id set (it's kept in place during the deal_entities migration),
-    but deal_entities may not be populated yet for rows written before this
+    Return deals for an entity — as its property, or via any market/
+    broadcaster it's linked to through deal_entities. Matches on entity_id
+    directly too, not just the join table: a deal always has entity_id set
+    (it's kept in place during the deal_entities migration), but
+    deal_entities may not be populated yet for rows written before this
     linking existed — matching on both means nothing regresses mid-deploy,
     and coverage only grows as deal_entities fills in (see
     backfill_deal_entities.py).
+
+    Sort order: current/unverified before superseded (so including
+    superseded deals via include_superseded=True can never rank a
+    superseded row above a current one just because it happens to be more
+    complete), then completeness (DEAL_COMPLETENESS_FIELDS) descending so
+    gappy rows sink rather than landing above fully-populated ones by
+    accident of insertion order, then date_added descending as the
+    tie-break within a completeness level — the same order this function
+    has always used, just no longer the top-level sort.
 
     Each row carries `property_name` — the canonical name of d.entity_id
     (the deal's property, per add_deal()'s docstring) — so a caller showing
@@ -1357,7 +1390,10 @@ def get_deals_for_entity(
                 d.entity_id = ?
                 OR d.id IN (SELECT deal_id FROM deal_entities WHERE entity_id = ?)
               )
-            ORDER BY d.date_added DESC
+            ORDER BY
+                CASE WHEN d.status = 'superseded' THEN 1 ELSE 0 END,
+                {_DEAL_COMPLETENESS_SQL} DESC,
+                d.date_added DESC
         """, (entity_id, entity_id)).fetchall()
         return [dict(r) for r in rows]
 
@@ -1497,8 +1533,12 @@ def get_deals_for_entities(
     Return all deals for a set of entities, with entity_name joined in
     (always the deal's PROPERTY name, even when the row matched via a
     market/broadcaster link — see get_deals_for_entity's docstring for why
-    both entity_id and deal_entities are checked), sorted by entity then
-    territory.
+    both entity_id and deal_entities are checked).
+
+    Sort order matches get_deals_for_entity(): current/unverified before
+    superseded, then completeness (DEAL_COMPLETENESS_FIELDS) descending,
+    then entity/territory as the tie-break within a completeness level —
+    the same order this function has always used, just no longer top-level.
     """
     if not entity_ids:
         return []
@@ -1514,7 +1554,10 @@ def get_deals_for_entities(
                 d.entity_id IN ({ph})
                 OR d.id IN (SELECT deal_id FROM deal_entities WHERE entity_id IN ({ph}))
               )
-            ORDER BY e.canonical_name COLLATE NOCASE, d.territory COLLATE NOCASE
+            ORDER BY
+                CASE WHEN d.status = 'superseded' THEN 1 ELSE 0 END,
+                {_DEAL_COMPLETENESS_SQL} DESC,
+                e.canonical_name COLLATE NOCASE, d.territory COLLATE NOCASE
         """, list(entity_ids) + list(entity_ids)).fetchall()
     return [dict(r) for r in rows]
 

@@ -373,19 +373,9 @@ section_title("Media rights deals")
 
 _show_sup = st.toggle("Include superseded deals", value=False, key="deals_show_sup")
 deals_all = db.get_deals_for_entity(entity_id, include_superseded=_show_sup)
-
-def _period_end_int(d: dict) -> int:
-    end = (d.get("period_end") or "").strip()
-    try:
-        return int(end[:4]) if end and end[:4].isdigit() else 9999
-    except ValueError:
-        return 9999
-
-deals_all.sort(key=lambda d: (
-    0 if d.get("status") != "superseded" else 1,
-    -_period_end_int(d),    # descending: 9999 (no end date = ongoing) sorts first
-    (d.get("territory") or "").lower(),
-))
+# Already ordered by db.get_deals_for_entity() — current before superseded,
+# then completeness (fuller rows first), then date_added — not re-sorted
+# here so the table matches the market-share aggregate below it exactly.
 
 if not deals_all:
     st.markdown(
@@ -425,6 +415,21 @@ else:
         _deal_table_html(deals_all, conflict_territories, show_property=show_property),
         unsafe_allow_html=True,
     )
+
+    def _is_populated(v) -> bool:
+        return v is not None and str(v).strip() != ""
+
+    n_incomplete = sum(
+        1 for d in deals_all
+        if any(not _is_populated(d.get(f)) for f in db.DEAL_COMPLETENESS_FIELDS)
+    )
+    if n_incomplete:
+        st.caption(
+            f"{n_incomplete} of {len(deals_all)} deal{'s' if len(deals_all) != 1 else ''} "
+            f"above {'is' if n_incomplete == 1 else 'are'} missing at least one field "
+            "(value, currency, rights holder, period, broadcaster or territory) — "
+            "sorted toward the bottom, not hidden."
+        )
 
 # Mark superseded
 current_deals_q = db.get_deals_for_entity(entity_id, include_superseded=False)
