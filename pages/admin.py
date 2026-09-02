@@ -12,6 +12,7 @@ from kb.db import (
 from kb.eval import run_case, load_eval_set, EVAL_SET_PATH
 from seed_entities import seed
 from backfill_deal_entities import compute_plan as compute_deal_entities_plan, apply_plan as apply_deal_entities_plan
+from repair_sky_broadcasters import compute_plan as compute_sky_plan, apply_plan as apply_sky_plan
 
 page_setup("admin", title="Admin — SN1 Knowledge Base")
 section_title("Entity management")
@@ -191,6 +192,72 @@ with st.expander("Backfill deal entity links", expanded=False):
             f"Baseline when this session started: {de_baseline['fully_unresolved']} deal(s), "
             f"{de_baseline['unresolved_strings']} string(s)."
         )
+
+with st.expander("Split Sky regional broadcasters", expanded=False):
+    st.caption(
+        "\"Sky Sports\" was seeded with aliases Sky, Sky UK, Sky Deutschland, Sky Italia — "
+        "collapsing three distinct regional operating companies into one UK-branded entity. "
+        "Any deal whose source said 'Sky Deutschland' or 'Sky Italia' got stored with "
+        "broadcaster='Sky Sports' instead. This splits the two regional names into their own "
+        "broadcaster entities (matching the existing Sky Mexico entity, which was never merged "
+        "in) and re-points every affected deal — classified by the deal's own territory field, "
+        "labeled **confirmed** when a chunk from its source entry literally names the regional "
+        "brand near a matching value, or **inferred** when only the territory implies it (e.g. "
+        "the source just said bare \"Sky\")."
+    )
+    st.caption(
+        "**Apply rewrites both the entity and the flagged deals** — it strips Sky Deutschland/"
+        "Sky Italia out of Sky Sports' aliases, creates the two new entities, updates each "
+        "flagged deal's broadcaster field, and swaps its deal_entities broadcaster link. "
+        "Safe to re-run — already-repointed deals no longer match broadcaster='Sky Sports' "
+        "so a second run is a no-op."
+    )
+
+    col_sky_preview, col_sky_apply = st.columns(2)
+    sky_preview_clicked = col_sky_preview.button("Preview", key="sky_preview")
+    sky_apply_clicked = col_sky_apply.button("Apply", key="sky_apply", type="primary")
+
+    if sky_preview_clicked:
+        st.session_state["sky_plan"] = compute_sky_plan(DB_PATH)
+
+    if sky_apply_clicked:
+        plan = st.session_state.get("sky_plan") or compute_sky_plan(DB_PATH)
+        n_written = apply_sky_plan(plan, DB_PATH)
+        st.session_state["sky_plan"] = None
+        st.session_state["sky_applied"] = (n_written, plan.get("new_entities", []))
+        st.rerun()
+
+    if "sky_applied" in st.session_state:
+        n_written, new_entities = st.session_state.pop("sky_applied")
+        st.success(
+            f"Re-pointed {n_written} deal(s) to {', '.join(new_entities) if new_entities else '(none)'}."
+        )
+
+    plan = st.session_state.get("sky_plan")
+    if plan:
+        if not plan["sky_sports_found"]:
+            st.info("No 'Sky Sports' broadcaster entity found — nothing to do.")
+        else:
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Sky Sports deal rows", plan["n_total"])
+            s2.metric("Genuinely UK", plan["n_unchanged"])
+            s3.metric("Confirmed", plan["n_confirmed"])
+            s4.metric("Inferred", plan["n_inferred"])
+
+            to_change = [r for r in plan["rows"] if r["target_broadcaster"]]
+            if to_change:
+                st.write(f"Proposed re-pointing ({len(to_change)} deal(s)):")
+                rows_df = pd.DataFrame([
+                    {
+                        "deal_id": r["deal_id"], "territory": r["territory"],
+                        "value": r["value"], "currency": r["currency"],
+                        "→ broadcaster": r["target_broadcaster"],
+                        "confidence": r["confidence"],
+                        "evidence": (r["evidence"] or "")[:120],
+                    }
+                    for r in to_change
+                ])
+                st.dataframe(rows_df, use_container_width=True, hide_index=True)
 
 _deleted_entries = get_deleted_entries()
 _deleted_label = (

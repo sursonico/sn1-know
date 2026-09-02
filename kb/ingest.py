@@ -782,7 +782,14 @@ async def ingest_file_async(path: Path, existing_sources: list[str]) -> str:
             for raw_deals in per_chunk_deals:
                 for d in raw_deals:
                     en = (d.get("entity_name") or "").strip()
-                    entity_row = db.find_entity_by_name_or_alias(en)
+                    # A deal's property is never itself a market/broadcaster/
+                    # rights_holder — those are the other parties to the deal.
+                    # Excluding them here stops an extracted property name that
+                    # coincidentally matches one of those (e.g. a territory
+                    # name) from silently becoming the deal's property.
+                    entity_row = db.find_entity_by_name_or_alias(
+                        en, exclude_types=db.NON_PROPERTY_ENTITY_TYPES,
+                    )
                     if entity_row:
                         confidence  = d.get("confidence", "medium")
                         deal_status = "unverified" if confidence == "low" else "current"

@@ -54,11 +54,12 @@ def _fmt_period(deal: dict) -> str:
     return "—"
 
 
-def _deal_table_html(deals: list[dict], conflict_territories: set[str]) -> str:
+def _deal_table_html(deals: list[dict], conflict_territories: set[str], show_property: bool = False) -> str:
     if not deals:
         return ""
     rows_html = ""
     for d in deals:
+        property_name = (d.get("property_name") or "—")
         territory     = (d.get("territory")     or "—")
         val_display   = _fmt_value(d)
         rights_holder = (d.get("rights_holder") or "—")
@@ -91,8 +92,11 @@ def _deal_table_html(deals: list[dict], conflict_territories: set[str]) -> str:
         reliability    = (d.get("reliability") or "reported")
         rel_badge_html = reliability_badge_html(reliability)
 
+        property_cell = f'<td>{property_name}</td>' if show_property else ""
+
         rows_html += (
             f'<tr class="{row_class}">'
+            f'{property_cell}'
             f'<td><strong>{territory}</strong>{conflict_icon}</td>'
             f'<td style="white-space:nowrap;color:#5A5A5A">{period}</td>'
             f'<td style="font-variant-numeric:tabular-nums;white-space:nowrap">{val_display}</td>'
@@ -102,10 +106,12 @@ def _deal_table_html(deals: list[dict], conflict_territories: set[str]) -> str:
             f'</tr>\n'
         )
 
+    property_header = "<th>Property</th>" if show_property else ""
     return (
         '<div style="overflow-x:auto;border:1px solid #E0D8CC;border-radius:8px">'
         '<table class="deals-table">'
         '<thead><tr>'
+        f'{property_header}'
         '<th>Territory</th><th>Period</th><th>Value</th><th>Rights holder</th><th>Notes</th><th></th>'
         '</tr></thead>'
         f'<tbody>{rows_html}</tbody>'
@@ -138,7 +144,18 @@ snips           = [e for e in entries if e["entry_type"] == "snippet"]
 current_entries = [e for e in entries if e.get("status", "current") != "superseded"]
 sup_entries     = [e for e in entries if e.get("status", "current") == "superseded"]
 deals_base      = db.get_deals_for_entity(entity_id, include_superseded=False)
-conflict_territories = db.find_conflicting_deal_territories(entity_id)
+
+# The conflict check is already scoped to deals whose property is this entity
+# (find_conflicting_deal_territories filters on deals.entity_id, the property
+# FK). On a market/broadcaster page that's structurally almost always empty —
+# a market is essentially never itself a deal's property — but "many current
+# deals for the same territory across different properties" is normal there,
+# not a conflict, so skip the check entirely rather than rely on it staying
+# empty by chance.
+conflict_territories = (
+    set() if entity.get("entity_type") == "market"
+    else db.find_conflicting_deal_territories(entity_id)
+)
 
 n_entries = len(entries)
 n_current = len(current_entries)
@@ -291,19 +308,32 @@ if not deals_all:
 else:
     n_curr_d = sum(1 for d in deals_all if d.get("status") == "current")
     n_terr   = len({(d.get("territory") or "").lower() for d in deals_all if d.get("territory")})
-    n_conf   = len(conflict_territories)
-    mc1, mc2, mc3 = st.columns(3)
-    mc1.metric("Current deals", n_curr_d)
-    mc2.metric("Territories",   n_terr)
-    mc3.metric("⚠ Conflicts",   n_conf)
-    if conflict_territories:
-        ter_list = ", ".join(sorted(t.title() for t in conflict_territories))
-        st.warning(
-            f"Multiple current deals exist for: **{ter_list}**. "
-            "Consider marking older deals as superseded using the tool below.",
-            icon=None,
-        )
-    st.markdown(_deal_table_html(deals_all, conflict_territories), unsafe_allow_html=True)
+    show_conflicts = entity.get("entity_type") != "market"
+    if show_conflicts:
+        n_conf = len(conflict_territories)
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Current deals", n_curr_d)
+        mc2.metric("Territories",   n_terr)
+        mc3.metric("⚠ Conflicts",   n_conf)
+        if conflict_territories:
+            ter_list = ", ".join(sorted(t.title() for t in conflict_territories))
+            st.warning(
+                f"Multiple current deals exist for: **{ter_list}**. "
+                "Consider marking older deals as superseded using the tool below.",
+                icon=None,
+            )
+    else:
+        mc1, mc2 = st.columns(2)
+        mc1.metric("Current deals", n_curr_d)
+        mc2.metric("Territories",   n_terr)
+    # Property is implicit on a property's own page (every row is its deal) —
+    # only worth a column when this page can show deals from more than one
+    # property, i.e. whenever some row's property isn't this page's entity.
+    show_property = any(d.get("entity_id") != entity_id for d in deals_all)
+    st.markdown(
+        _deal_table_html(deals_all, conflict_territories, show_property=show_property),
+        unsafe_allow_html=True,
+    )
 
 # Mark superseded
 current_deals_q = db.get_deals_for_entity(entity_id, include_superseded=False)

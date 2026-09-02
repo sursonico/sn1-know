@@ -624,10 +624,21 @@ def upsert_entity(
         return cur.lastrowid
 
 
+# Entity types that can never be a deal's PROPERTY (deal_entities role='property')
+# — they're the other parties to a deal, not the thing being licensed. Passed as
+# exclude_types to find_entity_by_name_or_alias() when resolving a deal's
+# "entity_name" at ingestion, so an extracted property name can't coincidentally
+# resolve to a market/broadcaster/rights_holder entity and silently become the
+# deal's property. A property is otherwise any type — competition, federation,
+# club, or other — so this is an exclusion list, not a single allowed type.
+NON_PROPERTY_ENTITY_TYPES = {"market", "broadcaster", "rights_holder"}
+
+
 def find_entity_by_name_or_alias(
     name: str,
     include_deleted: bool = False,
     entity_type: Optional[str] = None,
+    exclude_types: Optional[set] = None,
     path: Path = DB_PATH,
 ) -> Optional[dict]:
     """
@@ -635,12 +646,21 @@ def find_entity_by_name_or_alias(
     (case-insensitive). Pass entity_type to restrict the match to one type
     (e.g. 'market') — needed when resolving a deal's territory/broadcaster
     fragment, where an unqualified name could otherwise coincidentally match
-    an entity of the wrong kind.
+    an entity of the wrong kind. Pass exclude_types instead when several types
+    are acceptable but specific ones aren't (e.g. NON_PROPERTY_ENTITY_TYPES) —
+    entity_type and exclude_types are mutually exclusive filters.
     """
     name_lo = name.strip().lower()
     del_filter = "" if include_deleted else " AND deleted_at IS NULL"
-    type_filter = " AND entity_type=?" if entity_type else ""
-    type_args = [entity_type] if entity_type else []
+    type_filter = ""
+    type_args: list = []
+    if entity_type:
+        type_filter = " AND entity_type=?"
+        type_args = [entity_type]
+    elif exclude_types:
+        placeholders = ",".join("?" * len(exclude_types))
+        type_filter = f" AND entity_type NOT IN ({placeholders})"
+        type_args = list(exclude_types)
     with _conn(path) as con:
         # Exact canonical match
         row = con.execute(
@@ -954,6 +974,18 @@ def link_deal_to_entity(deal_id: int, entity_id: int, role: str, path: Path = DB
     with _conn(path) as con:
         con.execute(
             "INSERT OR IGNORE INTO deal_entities (deal_id, entity_id, role) VALUES (?,?,?)",
+            (deal_id, entity_id, role),
+        )
+
+
+def unlink_deal_from_entity(deal_id: int, entity_id: int, role: str, path: Path = DB_PATH) -> None:
+    """Remove one deal_entities link — the inverse of link_deal_to_entity().
+    Used when a deal's market/broadcaster was re-resolved to a different
+    entity (e.g. a repair pass re-pointing a broadcaster) and the old link
+    needs to come out, not just a new one added alongside it."""
+    with _conn(path) as con:
+        con.execute(
+            "DELETE FROM deal_entities WHERE deal_id=? AND entity_id=? AND role=?",
             (deal_id, entity_id, role),
         )
 
@@ -1283,11 +1315,19 @@ def get_deals_for_entity(
     linking existed — matching on both means nothing regresses mid-deploy,
     and coverage only grows as deal_entities fills in (see
     backfill_deal_entities.py).
+
+    Each row carries `property_name` — the canonical name of d.entity_id
+    (the deal's property, per add_deal()'s docstring) — so a caller showing
+    deals reached via a market/broadcaster link can label what property each
+    row is actually for. LEFT JOIN so a row is never dropped just because its
+    property entity is missing or soft-deleted; property_name is None then.
     """
     with _conn(path) as con:
         status_filter = "" if include_superseded else "AND d.status != 'superseded'"
         rows = con.execute(f"""
-            SELECT DISTINCT d.* FROM deals d
+            SELECT DISTINCT d.*, e.canonical_name AS property_name
+            FROM deals d
+            LEFT JOIN entities e ON e.id = d.entity_id
             WHERE d.deleted_at IS NULL {status_filter}
               AND (
                 d.entity_id = ?

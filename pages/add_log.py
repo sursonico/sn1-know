@@ -13,6 +13,7 @@ from kb.db import (
     add_deal, update_deal, delete_deal, get_deals_for_entity, find_entity_by_name_or_alias,
     get_entities_for_entry, get_chunks_for_entries, get_all_entries,
     get_all_entities, update_chunk_text, set_validation_warning,
+    NON_PROPERTY_ENTITY_TYPES,
 )
 from kb.llm import (
     enrich_snippet, enrich_url_article, enrich_document,
@@ -307,7 +308,7 @@ def _save_page_corrections(entry: dict, chunks: list[dict]) -> tuple[int, int, i
             en = (d.get("entity_name") or "").strip()
             if en not in page_names:
                 continue
-            entity_row = find_entity_by_name_or_alias(en)
+            entity_row = find_entity_by_name_or_alias(en, exclude_types=NON_PROPERTY_ENTITY_TYPES)
             if not entity_row:
                 continue
             confidence  = d.get("confidence", "medium")
@@ -671,7 +672,7 @@ with tab_log:
         # Save extracted deals — inherit entry reliability
         for d in pending.get("extracted_deals", []):
             en = (d.get("entity_name") or "").strip()
-            entity_row = find_entity_by_name_or_alias(en)
+            entity_row = find_entity_by_name_or_alias(en, exclude_types=NON_PROPERTY_ENTITY_TYPES)
             if entity_row:
                 confidence = d.get("confidence", "medium")
                 add_deal(
